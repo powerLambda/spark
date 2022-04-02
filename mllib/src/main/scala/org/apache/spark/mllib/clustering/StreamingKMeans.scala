@@ -19,12 +19,12 @@ package org.apache.spark.mllib.clustering
 
 import scala.reflect.ClassTag
 
-import org.apache.spark.Logging
 import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.JavaSparkContext._
+import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.linalg.{BLAS, Vector, Vectors}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.streaming.api.java.{JavaPairDStream, JavaDStream}
+import org.apache.spark.streaming.api.java.{JavaDStream, JavaPairDStream}
 import org.apache.spark.streaming.dstream.DStream
 import org.apache.spark.util.Utils
 import org.apache.spark.util.random.XORShiftRandom
@@ -36,13 +36,17 @@ import org.apache.spark.util.random.XORShiftRandom
  * doing a single iteration of the standard k-means algorithm.
  *
  * The update algorithm uses the "mini-batch" KMeans rule,
- * generalized to incorporate forgetfullness (i.e. decay).
+ * generalized to incorporate forgetfulness (i.e. decay).
  * The update rule (for each cluster) is:
  *
- * {{{
- * c_t+1 = [(c_t * n_t * a) + (x_t * m_t)] / [n_t + m_t]
- * n_t+t = n_t * a + m_t
- * }}}
+ * <blockquote>
+ *    $$
+ *    \begin{align}
+ *     c_{t+1} &= [(c_t * n_t * a) + (x_t * m_t)] / [n_t + m_t] \\
+ *     n_{t+1} &= n_t * a + m_t
+ *    \end{align}
+ *    $$
+ * </blockquote>
  *
  * Where c_t is the previously estimated centroid for that cluster,
  * n_t is the number of points assigned to it thus far, x_t is the centroid
@@ -78,20 +82,28 @@ class StreamingKMeansModel @Since("1.2.0") (
     val closest = data.map(point => (this.predict(point), (point, 1L)))
 
     // get sums and counts for updating each cluster
-    val mergeContribs: ((Vector, Long), (Vector, Long)) => (Vector, Long) = (p1, p2) => {
-      BLAS.axpy(1.0, p2._1, p1._1)
-      (p1._1, p1._2 + p2._2)
+    def mergeContribs(p1: (Vector, Long), p2: (Vector, Long)): (Vector, Long) = {
+      val sum =
+        if (p1._1 == null) {
+          p2._1
+        } else if (p2._1 == null) {
+          p1._1
+        } else {
+          BLAS.axpy(1.0, p2._1, p1._1)
+          p1._1
+        }
+      (sum, p1._2 + p2._2)
     }
     val dim = clusterCenters(0).size
 
     val pointStats: Array[(Int, (Vector, Long))] = closest
-      .aggregateByKey((Vectors.zeros(dim), 0L))(mergeContribs, mergeContribs)
+      .aggregateByKey((null.asInstanceOf[Vector], 0L))(mergeContribs, mergeContribs)
       .collect()
 
     val discount = timeUnit match {
       case StreamingKMeans.BATCHES => decayFactor
       case StreamingKMeans.POINTS =>
-        val numNewPoints = pointStats.view.map { case (_, (_, n)) =>
+        val numNewPoints = pointStats.iterator.map { case (_, (_, n)) =>
           n
         }.sum
         math.pow(decayFactor, numNewPoints)
@@ -121,9 +133,8 @@ class StreamingKMeansModel @Since("1.2.0") (
     }
 
     // Check whether the smallest cluster is dying. If so, split the largest cluster.
-    val weightsWithIndex = clusterWeights.view.zipWithIndex
-    val (maxWeight, largest) = weightsWithIndex.maxBy(_._1)
-    val (minWeight, smallest) = weightsWithIndex.minBy(_._1)
+    val (maxWeight, largest) = clusterWeights.iterator.zipWithIndex.maxBy(_._1)
+    val (minWeight, smallest) = clusterWeights.iterator.zipWithIndex.minBy(_._1)
     if (minWeight < 1e-8 * maxWeight) {
       logInfo(s"Cluster $smallest is dying. Split the largest cluster $largest into two.")
       val weight = (maxWeight + minWeight) / 2.0
@@ -135,13 +146,13 @@ class StreamingKMeansModel @Since("1.2.0") (
       while (j < dim) {
         val x = largestClusterCenter(j)
         val p = 1e-14 * math.max(math.abs(x), 1.0)
-        largestClusterCenter.toBreeze(j) = x + p
-        smallestClusterCenter.toBreeze(j) = x - p
+        largestClusterCenter.asBreeze(j) = x + p
+        smallestClusterCenter.asBreeze(j) = x - p
         j += 1
       }
     }
 
-    this
+    new StreamingKMeansModel(clusterCenters, clusterWeights)
   }
 }
 
@@ -178,24 +189,32 @@ class StreamingKMeans @Since("1.2.0") (
    */
   @Since("1.2.0")
   def setK(k: Int): this.type = {
+    require(k > 0,
+      s"Number of clusters must be positive but got ${k}")
     this.k = k
     this
   }
 
   /**
-   * Set the decay factor directly (for forgetful algorithms).
+   * Set the forgetfulness of the previous centroids.
    */
   @Since("1.2.0")
   def setDecayFactor(a: Double): this.type = {
+    require(a >= 0,
+      s"Decay factor must be nonnegative but got ${a}")
     this.decayFactor = a
     this
   }
 
   /**
-   * Set the half life and time unit ("batches" or "points") for forgetful algorithms.
+   * Set the half life and time unit ("batches" or "points"). If points, then the decay factor
+   * is raised to the power of number of new points and if batches, then decay factor will be
+   * used as is.
    */
   @Since("1.2.0")
   def setHalfLife(halfLife: Double, timeUnit: String): this.type = {
+    require(halfLife > 0,
+      s"Half life must be positive but got ${halfLife}")
     if (timeUnit != StreamingKMeans.BATCHES && timeUnit != StreamingKMeans.POINTS) {
       throw new IllegalArgumentException("Invalid time unit for decay: " + timeUnit)
     }
@@ -210,6 +229,12 @@ class StreamingKMeans @Since("1.2.0") (
    */
   @Since("1.2.0")
   def setInitialCenters(centers: Array[Vector], weights: Array[Double]): this.type = {
+    require(centers.size == weights.size,
+      "Number of initial centers must be equal to number of weights")
+    require(centers.size == k,
+      s"Number of initial centers must be ${k} but got ${centers.size}")
+    require(weights.forall(_ >= 0),
+      s"Weight for each initial center must be nonnegative but got [${weights.mkString(" ")}]")
     model = new StreamingKMeansModel(centers, weights)
     this
   }
@@ -223,6 +248,10 @@ class StreamingKMeans @Since("1.2.0") (
    */
   @Since("1.2.0")
   def setRandomCenters(dim: Int, weight: Double, seed: Long = Utils.random.nextLong): this.type = {
+    require(dim > 0,
+      s"Number of dimensions must be positive but got ${dim}")
+    require(weight >= 0,
+      s"Weight for each center must be nonnegative but got ${weight}")
     val random = new XORShiftRandom(seed)
     val centers = Array.fill(k)(Vectors.dense(Array.fill(dim)(random.nextGaussian())))
     val weights = Array.fill(k)(weight)
@@ -247,7 +276,7 @@ class StreamingKMeans @Since("1.2.0") (
    * @param data DStream containing vector data
    */
   @Since("1.2.0")
-  def trainOn(data: DStream[Vector]) {
+  def trainOn(data: DStream[Vector]): Unit = {
     assertInitialized()
     data.foreachRDD { (rdd, time) =>
       model = model.update(rdd, decayFactor, timeUnit)

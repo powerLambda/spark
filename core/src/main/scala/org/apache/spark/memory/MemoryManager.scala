@@ -17,14 +17,20 @@
 
 package org.apache.spark.memory
 
+import java.lang.management.{ManagementFactory, PlatformManagedObject}
 import javax.annotation.concurrent.GuardedBy
 
-import scala.collection.mutable
+import scala.util.Try
 
-import org.apache.spark.{SparkConf, Logging}
-import org.apache.spark.storage.{BlockId, BlockStatus, MemoryStore}
+import org.apache.spark.SparkConf
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config._
+import org.apache.spark.storage.BlockId
+import org.apache.spark.storage.memory.MemoryStore
+import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.array.ByteArrayMethods
 import org.apache.spark.unsafe.memory.MemoryAllocator
+import org.apache.spark.util.Utils
 
 /**
  * An abstract memory manager that enforces how memory is shared between execution and storage.
@@ -36,48 +42,60 @@ import org.apache.spark.unsafe.memory.MemoryAllocator
 private[spark] abstract class MemoryManager(
     conf: SparkConf,
     numCores: Int,
-    storageMemory: Long,
+    onHeapStorageMemory: Long,
     onHeapExecutionMemory: Long) extends Logging {
+
+  require(onHeapExecutionMemory > 0, "onHeapExecutionMemory must be > 0")
 
   // -- Methods related to memory allocation policies and bookkeeping ------------------------------
 
   @GuardedBy("this")
-  protected val storageMemoryPool = new StorageMemoryPool(this)
+  protected val onHeapStorageMemoryPool = new StorageMemoryPool(this, MemoryMode.ON_HEAP)
   @GuardedBy("this")
-  protected val onHeapExecutionMemoryPool = new ExecutionMemoryPool(this, "on-heap execution")
+  protected val offHeapStorageMemoryPool = new StorageMemoryPool(this, MemoryMode.OFF_HEAP)
   @GuardedBy("this")
-  protected val offHeapExecutionMemoryPool = new ExecutionMemoryPool(this, "off-heap execution")
+  protected val onHeapExecutionMemoryPool = new ExecutionMemoryPool(this, MemoryMode.ON_HEAP)
+  @GuardedBy("this")
+  protected val offHeapExecutionMemoryPool = new ExecutionMemoryPool(this, MemoryMode.OFF_HEAP)
 
-  storageMemoryPool.incrementPoolSize(storageMemory)
+  onHeapStorageMemoryPool.incrementPoolSize(onHeapStorageMemory)
   onHeapExecutionMemoryPool.incrementPoolSize(onHeapExecutionMemory)
-  offHeapExecutionMemoryPool.incrementPoolSize(conf.getSizeAsBytes("spark.memory.offHeap.size", 0))
+
+  protected[this] val maxOffHeapMemory = conf.get(MEMORY_OFFHEAP_SIZE)
+  protected[this] val offHeapStorageMemory =
+    (maxOffHeapMemory * conf.get(MEMORY_STORAGE_FRACTION)).toLong
+
+  offHeapExecutionMemoryPool.incrementPoolSize(maxOffHeapMemory - offHeapStorageMemory)
+  offHeapStorageMemoryPool.incrementPoolSize(offHeapStorageMemory)
 
   /**
-   * Total available memory for storage, in bytes. This amount can vary over time, depending on
-   * the MemoryManager implementation.
+   * Total available on heap memory for storage, in bytes. This amount can vary over time,
+   * depending on the MemoryManager implementation.
    * In this model, this is equivalent to the amount of memory not occupied by execution.
    */
-  def maxStorageMemory: Long
+  def maxOnHeapStorageMemory: Long
+
+  /**
+   * Total available off heap memory for storage, in bytes. This amount can vary over time,
+   * depending on the MemoryManager implementation.
+   */
+  def maxOffHeapStorageMemory: Long
 
   /**
    * Set the [[MemoryStore]] used by this manager to evict cached blocks.
    * This must be set after construction due to initialization ordering constraints.
    */
   final def setMemoryStore(store: MemoryStore): Unit = synchronized {
-    storageMemoryPool.setMemoryStore(store)
+    onHeapStorageMemoryPool.setMemoryStore(store)
+    offHeapStorageMemoryPool.setMemoryStore(store)
   }
-
-  // TODO: avoid passing evicted blocks around to simplify method signatures (SPARK-10985)
 
   /**
    * Acquire N bytes of memory to cache the given block, evicting existing ones if necessary.
-   * Blocks evicted in the process, if any, are added to `evictedBlocks`.
+   *
    * @return whether all N bytes were successfully granted.
    */
-  def acquireStorageMemory(
-      blockId: BlockId,
-      numBytes: Long,
-      evictedBlocks: mutable.Buffer[(BlockId, BlockStatus)]): Boolean
+  def acquireStorageMemory(blockId: BlockId, numBytes: Long, memoryMode: MemoryMode): Boolean
 
   /**
    * Acquire N bytes of memory to unroll the given block, evicting existing ones if necessary.
@@ -85,14 +103,10 @@ private[spark] abstract class MemoryManager(
    * This extra method allows subclasses to differentiate behavior between acquiring storage
    * memory and acquiring unroll memory. For instance, the memory management model in Spark
    * 1.5 and before places a limit on the amount of space that can be freed from unrolling.
-   * Blocks evicted in the process, if any, are added to `evictedBlocks`.
    *
    * @return whether all N bytes were successfully granted.
    */
-  def acquireUnrollMemory(
-      blockId: BlockId,
-      numBytes: Long,
-      evictedBlocks: mutable.Buffer[(BlockId, BlockStatus)]): Boolean
+  def acquireUnrollMemory(blockId: BlockId, numBytes: Long, memoryMode: MemoryMode): Boolean
 
   /**
    * Try to acquire up to `numBytes` of execution memory for the current task and return the
@@ -125,6 +139,7 @@ private[spark] abstract class MemoryManager(
 
   /**
    * Release all memory for the given task and mark it as inactive (e.g. when a task ends).
+   *
    * @return the number of bytes freed.
    */
   private[memory] def releaseAllExecutionMemoryForTask(taskAttemptId: Long): Long = synchronized {
@@ -135,22 +150,26 @@ private[spark] abstract class MemoryManager(
   /**
    * Release N bytes of storage memory.
    */
-  def releaseStorageMemory(numBytes: Long): Unit = synchronized {
-    storageMemoryPool.releaseMemory(numBytes)
+  def releaseStorageMemory(numBytes: Long, memoryMode: MemoryMode): Unit = synchronized {
+    memoryMode match {
+      case MemoryMode.ON_HEAP => onHeapStorageMemoryPool.releaseMemory(numBytes)
+      case MemoryMode.OFF_HEAP => offHeapStorageMemoryPool.releaseMemory(numBytes)
+    }
   }
 
   /**
    * Release all storage memory acquired.
    */
   final def releaseAllStorageMemory(): Unit = synchronized {
-    storageMemoryPool.releaseAllMemory()
+    onHeapStorageMemoryPool.releaseAllMemory()
+    offHeapStorageMemoryPool.releaseAllMemory()
   }
 
   /**
    * Release N bytes of unroll memory.
    */
-  final def releaseUnrollMemory(numBytes: Long): Unit = synchronized {
-    releaseStorageMemory(numBytes)
+  final def releaseUnrollMemory(numBytes: Long, memoryMode: MemoryMode): Unit = synchronized {
+    releaseStorageMemory(numBytes, memoryMode)
   }
 
   /**
@@ -164,7 +183,35 @@ private[spark] abstract class MemoryManager(
    * Storage memory currently in use, in bytes.
    */
   final def storageMemoryUsed: Long = synchronized {
-    storageMemoryPool.memoryUsed
+    onHeapStorageMemoryPool.memoryUsed + offHeapStorageMemoryPool.memoryUsed
+  }
+
+  /**
+   *  On heap execution memory currently in use, in bytes.
+   */
+  final def onHeapExecutionMemoryUsed: Long = synchronized {
+    onHeapExecutionMemoryPool.memoryUsed
+  }
+
+  /**
+   *  Off heap execution memory currently in use, in bytes.
+   */
+  final def offHeapExecutionMemoryUsed: Long = synchronized {
+    offHeapExecutionMemoryPool.memoryUsed
+  }
+
+  /**
+   *  On heap storage memory currently in use, in bytes.
+   */
+  final def onHeapStorageMemoryUsed: Long = synchronized {
+    onHeapStorageMemoryPool.memoryUsed
+  }
+
+  /**
+   *  Off heap storage memory currently in use, in bytes.
+   */
+  final def offHeapStorageMemoryUsed: Long = synchronized {
+    offHeapStorageMemoryPool.memoryUsed
   }
 
   /**
@@ -182,9 +229,11 @@ private[spark] abstract class MemoryManager(
    * sun.misc.Unsafe.
    */
   final val tungstenMemoryMode: MemoryMode = {
-    if (conf.getBoolean("spark.memory.offHeap.enabled", false)) {
-      require(conf.getSizeAsBytes("spark.memory.offHeap.size", 0) > 0,
+    if (conf.get(MEMORY_OFFHEAP_ENABLED)) {
+      require(conf.get(MEMORY_OFFHEAP_SIZE) > 0,
         "spark.memory.offHeap.size must be > 0 when spark.memory.offHeap.enabled == true")
+      require(Platform.unaligned(),
+        "No support for unaligned Unsafe. Set spark.memory.offHeap.enabled to false.")
       MemoryMode.OFF_HEAP
     } else {
       MemoryMode.ON_HEAP
@@ -197,8 +246,12 @@ private[spark] abstract class MemoryManager(
    * If user didn't explicitly set "spark.buffer.pageSize", we figure out the default value
    * by looking at the number of cores available to the process, and the total amount of memory,
    * and then divide it by a factor of safety.
+   *
+   * SPARK-37593 If we are using G1GC, it's better to take the LONG_ARRAY_OFFSET
+   * into consideration so that the requested memory size is power of 2
+   * and can be divided by G1 heap region size to reduce memory waste within one G1 region.
    */
-  val pageSizeBytes: Long = {
+  private lazy val defaultPageSizeBytes = {
     val minPageSize = 1L * 1024 * 1024   // 1MB
     val maxPageSize = 64L * minPageSize  // 64MB
     val cores = if (numCores > 0) numCores else Runtime.getRuntime.availableProcessors()
@@ -209,9 +262,15 @@ private[spark] abstract class MemoryManager(
       case MemoryMode.OFF_HEAP => offHeapExecutionMemoryPool.poolSize
     }
     val size = ByteArrayMethods.nextPowerOf2(maxTungstenMemory / cores / safetyFactor)
-    val default = math.min(maxPageSize, math.max(minPageSize, size))
-    conf.getSizeAsBytes("spark.buffer.pageSize", default)
+    val chosenPageSize = math.min(maxPageSize, math.max(minPageSize, size))
+    if (isG1GC && tungstenMemoryMode == MemoryMode.ON_HEAP) {
+      chosenPageSize - Platform.LONG_ARRAY_OFFSET
+    } else {
+      chosenPageSize
+    }
   }
+
+  val pageSizeBytes: Long = conf.get(BUFFER_PAGESIZE).getOrElse(defaultPageSizeBytes)
 
   /**
    * Allocates memory for use by Unsafe/Tungsten code.
@@ -221,5 +280,23 @@ private[spark] abstract class MemoryManager(
       case MemoryMode.ON_HEAP => MemoryAllocator.HEAP
       case MemoryMode.OFF_HEAP => MemoryAllocator.UNSAFE
     }
+  }
+
+  /**
+   * Return whether we are using G1GC or not
+   */
+  private lazy val isG1GC: Boolean = {
+    Try {
+      val clazz = Utils.classForName("com.sun.management.HotSpotDiagnosticMXBean")
+        .asInstanceOf[Class[_ <: PlatformManagedObject]]
+      val vmOptionClazz = Utils.classForName("com.sun.management.VMOption")
+      val hotSpotDiagnosticMXBean = ManagementFactory.getPlatformMXBean(clazz)
+      val vmOptionMethod = clazz.getMethod("getVMOption", classOf[String])
+      val valueMethod = vmOptionClazz.getMethod("getValue")
+
+      val useG1GCObject = vmOptionMethod.invoke(hotSpotDiagnosticMXBean, "UseG1GC")
+      val useG1GC = valueMethod.invoke(useG1GCObject).asInstanceOf[String]
+      "true".equals(useG1GC)
+    }.getOrElse(false)
   }
 }

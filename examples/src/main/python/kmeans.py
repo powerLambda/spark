@@ -17,24 +17,23 @@
 
 """
 The K-means algorithm written from scratch against PySpark. In practice,
-one may prefer to use the KMeans algorithm in MLlib, as shown in
-examples/src/main/python/mllib/kmeans.py.
+one may prefer to use the KMeans algorithm in ML, as shown in
+examples/src/main/python/ml/kmeans_example.py.
 
 This example requires NumPy (http://www.numpy.org/).
 """
-from __future__ import print_function
-
 import sys
+from typing import List
 
 import numpy as np
-from pyspark import SparkContext
+from pyspark.sql import SparkSession
 
 
-def parseVector(line):
+def parseVector(line: str) -> np.ndarray:
     return np.array([float(x) for x in line.split(' ')])
 
 
-def closestPoint(p, centers):
+def closestPoint(p: np.ndarray, centers: List[np.ndarray]) -> int:
     bestIndex = 0
     closest = float("+inf")
     for i in range(len(centers)):
@@ -49,14 +48,18 @@ if __name__ == "__main__":
 
     if len(sys.argv) != 4:
         print("Usage: kmeans <file> <k> <convergeDist>", file=sys.stderr)
-        exit(-1)
+        sys.exit(-1)
 
     print("""WARN: This is a naive implementation of KMeans Clustering and is given
-       as an example! Please refer to examples/src/main/python/mllib/kmeans.py for an example on
-       how to use MLlib's KMeans implementation.""", file=sys.stderr)
+       as an example! Please refer to examples/src/main/python/ml/kmeans_example.py for an
+       example on how to use ML's KMeans implementation.""", file=sys.stderr)
 
-    sc = SparkContext(appName="PythonKMeans")
-    lines = sc.textFile(sys.argv[1])
+    spark = SparkSession\
+        .builder\
+        .appName("PythonKMeans")\
+        .getOrCreate()
+
+    lines = spark.read.text(sys.argv[1]).rdd.map(lambda r: r[0])
     data = lines.map(parseVector).cache()
     K = int(sys.argv[2])
     convergeDist = float(sys.argv[3])
@@ -79,4 +82,4 @@ if __name__ == "__main__":
 
     print("Final centers: " + str(kPoints))
 
-    sc.stop()
+    spark.stop()

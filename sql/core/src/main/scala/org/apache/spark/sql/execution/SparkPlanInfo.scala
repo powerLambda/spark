@@ -18,8 +18,11 @@
 package org.apache.spark.sql.execution
 
 import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
+import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
+import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
 import org.apache.spark.sql.execution.metric.SQLMetricInfo
-import org.apache.spark.util.Utils
+import org.apache.spark.sql.internal.SQLConf
 
 /**
  * :: DeveloperApi ::
@@ -31,17 +34,46 @@ class SparkPlanInfo(
     val simpleString: String,
     val children: Seq[SparkPlanInfo],
     val metadata: Map[String, String],
-    val metrics: Seq[SQLMetricInfo])
+    val metrics: Seq[SQLMetricInfo]) {
 
-private[sql] object SparkPlanInfo {
+  override def hashCode(): Int = {
+    // hashCode of simpleString should be good enough to distinguish the plans from each other
+    // within a plan
+    simpleString.hashCode
+  }
+
+  override def equals(other: Any): Boolean = other match {
+    case o: SparkPlanInfo =>
+      nodeName == o.nodeName && simpleString == o.simpleString && children == o.children
+    case _ => false
+  }
+}
+
+private[execution] object SparkPlanInfo {
 
   def fromSparkPlan(plan: SparkPlan): SparkPlanInfo = {
-    val metrics = plan.metrics.toSeq.map { case (key, metric) =>
-      new SQLMetricInfo(metric.name.getOrElse(key), metric.id,
-        Utils.getFormattedClassName(metric.param))
+    val children = plan match {
+      case ReusedExchangeExec(_, child) => child :: Nil
+      case ReusedSubqueryExec(child) => child :: Nil
+      case a: AdaptiveSparkPlanExec => a.executedPlan :: Nil
+      case stage: QueryStageExec => stage.plan :: Nil
+      case inMemTab: InMemoryTableScanExec => inMemTab.relation.cachedPlan :: Nil
+      case _ => plan.children ++ plan.subqueries
     }
-    val children = plan.children.map(fromSparkPlan)
+    val metrics = plan.metrics.toSeq.map { case (key, metric) =>
+      new SQLMetricInfo(metric.name.getOrElse(key), metric.id, metric.metricType)
+    }
 
-    new SparkPlanInfo(plan.nodeName, plan.simpleString, children, plan.metadata, metrics)
+    // dump the file scan metadata (e.g file path) to event log
+    val metadata = plan match {
+      case fileScan: FileSourceScanExec => fileScan.metadata
+      case _ => Map[String, String]()
+    }
+    new SparkPlanInfo(
+      plan.nodeName,
+      plan.simpleString(SQLConf.get.maxToStringFields),
+      children.map(fromSparkPlan),
+      metadata,
+      metrics)
   }
 }

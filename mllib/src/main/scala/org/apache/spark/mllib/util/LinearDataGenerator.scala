@@ -20,21 +20,17 @@ package org.apache.spark.mllib.util
 import scala.collection.JavaConverters._
 import scala.util.Random
 
-import com.github.fommil.netlib.BLAS.{getInstance => blas}
-
 import org.apache.spark.SparkContext
-import org.apache.spark.annotation.{DeveloperApi, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.mllib.linalg.{BLAS, Vectors}
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.rdd.RDD
 
 /**
- * :: DeveloperApi ::
  * Generate sample data used for Linear Data. This class generates
  * uniformly random values for every feature and adds Gaussian noise with mean `eps` to the
  * response variable `Y`.
  */
-@DeveloperApi
 @Since("0.8.0")
 object LinearDataGenerator {
 
@@ -77,7 +73,7 @@ object LinearDataGenerator {
       nPoints: Int,
       seed: Int,
       eps: Double = 0.1): Seq[LabeledPoint] = {
-    generateLinearInput(intercept, weights, Array.fill[Double](weights.length)(0.0),
+    generateLinearInput(intercept, weights, Array.ofDim[Double](weights.length),
       Array.fill[Double](weights.length)(1.0 / 3.0), nPoints, seed, eps)
   }
 
@@ -158,7 +154,7 @@ object LinearDataGenerator {
 
   /**
    * Generate an RDD containing sample data for Linear Regression models - including Ridge, Lasso,
-   * and uregularized variants.
+   * and unregularized variants.
    *
    * @param sc SparkContext to be used for generating the RDD.
    * @param nexamples Number of examples that will be contained in the RDD.
@@ -175,7 +171,7 @@ object LinearDataGenerator {
       nfeatures: Int,
       eps: Double,
       nparts: Int = 2,
-      intercept: Double = 0.0) : RDD[LabeledPoint] = {
+      intercept: Double = 0.0): RDD[LabeledPoint] = {
     val random = new Random(42)
     // Random values distributed uniformly in [-0.5, 0.5]
     val w = Array.fill(nfeatures)(random.nextDouble() - 0.5)
@@ -183,13 +179,13 @@ object LinearDataGenerator {
     val data: RDD[LabeledPoint] = sc.parallelize(0 until nparts, nparts).flatMap { p =>
       val seed = 42 + p
       val examplesInPartition = nexamples / nparts
-      generateLinearInput(intercept, w.toArray, examplesInPartition, seed, eps)
+      generateLinearInput(intercept, w, examplesInPartition, seed, eps)
     }
     data
   }
 
   @Since("0.8.0")
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     if (args.length < 2) {
       // scalastyle:off println
       println("Usage: LinearDataGenerator " +

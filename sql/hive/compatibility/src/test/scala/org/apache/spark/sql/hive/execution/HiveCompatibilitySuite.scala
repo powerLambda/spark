@@ -18,57 +18,75 @@
 package org.apache.spark.sql.hive.execution
 
 import java.io.File
-import java.util.{Locale, TimeZone}
 
-import org.apache.spark.sql.catalyst.rules.RuleExecutor
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.sql.SQLConf
+import org.apache.spark.sql.catalyst.rules.RuleExecutor
 import org.apache.spark.sql.hive.test.TestHive
-import org.apache.spark.tags.ExtendedHiveTest
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy
+import org.apache.spark.tags.SlowHiveTest
 
 /**
  * Runs the test cases that are included in the hive distribution.
  */
-@ExtendedHiveTest
+@SlowHiveTest
 class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
   // TODO: bundle in jar files... get from classpath
   private lazy val hiveQueryDir = TestHive.getHiveFile(
     "ql/src/test/queries/clientpositive".split("/").mkString(File.separator))
 
-  private val originalTimeZone = TimeZone.getDefault
-  private val originalLocale = Locale.getDefault
   private val originalColumnBatchSize = TestHive.conf.columnBatchSize
   private val originalInMemoryPartitionPruning = TestHive.conf.inMemoryPartitionPruning
+  private val originalCrossJoinEnabled = TestHive.conf.crossJoinEnabled
+  private val originalSessionLocalTimeZone = TestHive.conf.sessionLocalTimeZone
+  private val originalAnsiMode = TestHive.conf.getConf(SQLConf.ANSI_ENABLED)
+  private val originalCreateHiveTable =
+    TestHive.conf.getConf(SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT)
 
-  def testCases = hiveQueryDir.listFiles.map(f => f.getName.stripSuffix(".q") -> f)
+  def testCases: Seq[(String, File)] = {
+    hiveQueryDir.listFiles.map(f => f.getName.stripSuffix(".q") -> f)
+  }
 
-  override def beforeAll() {
-    TestHive.cacheTables = true
-    // Timezone is fixed to America/Los_Angeles for those timezone sensitive tests (timestamp_*)
-    TimeZone.setDefault(TimeZone.getTimeZone("America/Los_Angeles"))
-    // Add Locale setting
-    Locale.setDefault(Locale.US)
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    TestHive.setCacheTables(true)
     // Set a relatively small column batch size for testing purposes
     TestHive.setConf(SQLConf.COLUMN_BATCH_SIZE, 5)
     // Enable in-memory partition pruning for testing purposes
     TestHive.setConf(SQLConf.IN_MEMORY_PARTITION_PRUNING, true)
-    RuleExecutor.resetTime()
+    // Ensures that cross joins are enabled so that we can test them
+    TestHive.setConf(SQLConf.CROSS_JOINS_ENABLED, true)
+    // Hive doesn't follow ANSI Standard.
+    TestHive.setConf(SQLConf.ANSI_ENABLED, false)
+    // Ensures that the table insertion behavior is consistent with Hive
+    TestHive.setConf(SQLConf.STORE_ASSIGNMENT_POLICY, StoreAssignmentPolicy.LEGACY.toString)
+    // Fix session local timezone to America/Los_Angeles for those timezone sensitive tests
+    // (timestamp_*)
+    TestHive.setConf(SQLConf.SESSION_LOCAL_TIMEZONE, "America/Los_Angeles")
+    TestHive.setConf(SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT, true)
+    RuleExecutor.resetMetrics()
   }
 
-  override def afterAll() {
-    TestHive.cacheTables = false
-    TimeZone.setDefault(originalTimeZone)
-    Locale.setDefault(originalLocale)
-    TestHive.setConf(SQLConf.COLUMN_BATCH_SIZE, originalColumnBatchSize)
-    TestHive.setConf(SQLConf.IN_MEMORY_PARTITION_PRUNING, originalInMemoryPartitionPruning)
+  override def afterAll(): Unit = {
+    try {
+      TestHive.setCacheTables(false)
+      TestHive.setConf(SQLConf.COLUMN_BATCH_SIZE, originalColumnBatchSize)
+      TestHive.setConf(SQLConf.IN_MEMORY_PARTITION_PRUNING, originalInMemoryPartitionPruning)
+      TestHive.setConf(SQLConf.CROSS_JOINS_ENABLED, originalCrossJoinEnabled)
+      TestHive.setConf(SQLConf.SESSION_LOCAL_TIMEZONE, originalSessionLocalTimeZone)
+      TestHive.setConf(SQLConf.ANSI_ENABLED, originalAnsiMode)
+      TestHive.setConf(SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT, originalCreateHiveTable)
 
-    // For debugging dump some statistics about how much time was spent in various optimizer rules.
-    logWarning(RuleExecutor.dumpTimeSpent())
+      // For debugging dump some statistics about how much time was spent in various optimizer rules
+      logWarning(RuleExecutor.dumpTimeSpent())
+    } finally {
+      super.afterAll()
+    }
   }
 
   /** A list of tests deemed out of scope currently and thus completely disregarded. */
-  override def blackList = Seq(
+  override def excludeList: Seq[String] = Seq(
     // These tests use hooks that are not on the classpath and thus break all subsequent execution.
     "hook_order",
     "hook_context_cs",
@@ -103,7 +121,7 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "alter_merge",
     "alter_concatenate_indexed_table",
     "protectmode2",
-    //"describe_table",
+    // "describe_table",
     "describe_comment_nonascii",
 
     "create_merge_compressed",
@@ -129,6 +147,10 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     // Hive returns null for minute('2015-03-18')
     "udf_minute",
 
+    // Hive DESC FUNCTION returns a string to indicate undefined function, while Spark triggers a
+    // query error.
+    "udf_index",
+    "udf_stddev_pop",
 
     // Cant run without local map/reduce.
     "index_auto_update",
@@ -163,7 +185,7 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "skewjoin",
     "database",
 
-    // These tests fail and and exit the JVM.
+    // These tests fail and exit the JVM.
     "auto_join18_multi_distinct",
     "join18_multi_distinct",
     "input44",
@@ -283,13 +305,15 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "compute_stats_empty_table",
     "compute_stats_long",
     "create_view_translate",
-    "show_create_table_serde",
     "show_tblproperties",
 
     // Odd changes to output
     "merge4",
 
-    // Thift is broken...
+    // Unsupported underscore syntax.
+    "inputddl5",
+
+    // Thrift is broken...
     "inputddl8",
 
     // Hive changed ordering of ddl:
@@ -308,75 +332,105 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
 
     // The difference between the double numbers generated by Hive and Spark
     // can be ignored (e.g., 0.6633880657639323 and 0.6633880657639322)
-    "udaf_corr"
-  )
+    "udaf_corr",
 
-  /**
-   * The set of tests that are believed to be working in catalyst. Tests not on whiteList or
-   * blacklist are implicitly marked as ignored.
-   */
-  override def whiteList = Seq(
-    "add_part_exist",
-    "add_part_multiple",
-    "add_partition_no_whitelist",
-    "add_partition_with_whitelist",
-    "alias_casted_column",
-    "alter2",
-    "alter3",
-    "alter4",
-    "alter5",
-    "alter_index",
-    "alter_merge_2",
-    "alter_partition_format_loc",
+    // Feature removed in HIVE-11145
     "alter_partition_protect_mode",
-    "alter_partition_with_whitelist",
-    "alter_rename_partition",
-    "alter_table_serde",
-    "alter_varchar1",
-    "alter_varchar2",
+    "drop_partitions_ignore_protection",
+    "protectmode",
+
+    // Hive returns null rather than NaN when n = 1
+    "udaf_covar_samp",
+
+    // The implementation of GROUPING__ID in Hive is wrong (not match with doc).
+    "groupby_grouping_id1",
+    "groupby_grouping_id2",
+    "groupby_grouping_sets1",
+
+    // Spark parser treats numerical literals differently: it creates decimals instead of doubles.
+    "udf_abs",
+    "udf_format_number",
+    "udf_round",
+    "udf_round_3",
+    "view_cast",
+
+    // These tests check the VIEW table definition, but Spark handles CREATE VIEW itself and
+    // generates different View Expanded Text.
     "alter_view_as_select",
-    "ambiguous_col",
-    "annotate_stats_join",
-    "annotate_stats_limit",
-    "annotate_stats_part",
-    "annotate_stats_table",
-    "annotate_stats_union",
-    "auto_join0",
-    "auto_join1",
-    "auto_join10",
-    "auto_join11",
-    "auto_join12",
-    "auto_join13",
-    "auto_join14",
-    "auto_join14_hadoop20",
-    "auto_join15",
-    "auto_join17",
-    "auto_join18",
-    "auto_join19",
-    "auto_join2",
-    "auto_join20",
-    "auto_join21",
-    "auto_join22",
-    "auto_join23",
-    "auto_join24",
-    "auto_join25",
-    "auto_join26",
-    "auto_join27",
-    "auto_join28",
-    "auto_join3",
-    "auto_join30",
-    "auto_join31",
+
+    // We don't support show create table commands in general
+    "show_create_table_alter",
+    "show_create_table_db_table",
+    "show_create_table_delimited",
+    "show_create_table_does_not_exist",
+    "show_create_table_index",
+    "show_create_table_partitioned",
+    "show_create_table_serde",
+    "show_create_table_view",
+
+    // These tests try to change how a table is bucketed, which we don't support
+    "alter4",
+    "sort_merge_join_desc_5",
+    "sort_merge_join_desc_6",
+    "sort_merge_join_desc_7",
+
+    // These tests try to create a table with bucketed columns, which we don't support
     "auto_join32",
-    "auto_join4",
-    "auto_join5",
-    "auto_join6",
-    "auto_join7",
-    "auto_join8",
-    "auto_join9",
     "auto_join_filters",
-    "auto_join_nulls",
-    "auto_join_reordering_values",
     "auto_smb_mapjoin_14",
+    "ct_case_insensitive",
+    "explain_rearrange",
+    "groupby_sort_10",
+    "groupby_sort_2",
+    "groupby_sort_3",
+    "groupby_sort_4",
+    "groupby_sort_5",
+    "groupby_sort_7",
+    "groupby_sort_8",
+    "groupby_sort_9",
+    "groupby_sort_test_1",
+    "inputddl4",
+    "join_filters",
+    "join_nulls",
+    "join_nullsafe",
+    "load_dyn_part2",
+    "orc_empty_files",
+    "reduce_deduplicate",
+    "smb_mapjoin9",
+    "smb_mapjoin_1",
+    "smb_mapjoin_10",
+    "smb_mapjoin_13",
+    "smb_mapjoin_14",
+    "smb_mapjoin_15",
+    "smb_mapjoin_16",
+    "smb_mapjoin_17",
+    "smb_mapjoin_2",
+    "smb_mapjoin_21",
+    "smb_mapjoin_25",
+    "smb_mapjoin_3",
+    "smb_mapjoin_4",
+    "smb_mapjoin_5",
+    "smb_mapjoin_6",
+    "smb_mapjoin_7",
+    "smb_mapjoin_8",
+    "sort_merge_join_desc_1",
+    "sort_merge_join_desc_2",
+    "sort_merge_join_desc_3",
+    "sort_merge_join_desc_4",
+
+    // These tests try to create a table with skewed columns, which we don't support
+    "create_skewed_table1",
+    "skewjoinopt13",
+    "skewjoinopt18",
+    "skewjoinopt9",
+
+    // This test tries to create a table like with TBLPROPERTIES clause, which we don't support.
+    "create_like_tbl_props",
+
+    // Index commands are not supported
+    "drop_index",
+    "drop_index_removes_partition_dirs",
+    "alter_index",
     "auto_sortmerge_join_1",
     "auto_sortmerge_join_10",
     "auto_sortmerge_join_11",
@@ -393,6 +447,181 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "auto_sortmerge_join_7",
     "auto_sortmerge_join_8",
     "auto_sortmerge_join_9",
+
+    // Macro commands are not supported
+    "macro",
+
+    // Create partitioned view is not supported
+    "create_like_view",
+    "describe_formatted_view_partitioned",
+
+    // This uses CONCATENATE, which we don't support
+    "alter_merge_2",
+
+    // TOUCH is not supported
+    "touch",
+
+    // INPUTDRIVER and OUTPUTDRIVER are not supported
+    "inoutdriver",
+
+    // We do not support ALTER TABLE ADD COLUMN, ALTER TABLE REPLACE COLUMN,
+    // ALTER TABLE CHANGE COLUMN, and ALTER TABLE SET FILEFORMAT.
+    // We have converted the useful parts of these tests to tests
+    // in org.apache.spark.sql.hive.execution.SQLQuerySuite.
+    "alter_partition_format_loc",
+    "alter_varchar1",
+    "alter_varchar2",
+    "date_3",
+    "diff_part_input_formats",
+    "disallow_incompatible_type_change_off",
+    "fileformat_mix",
+    "input3",
+    "partition_schema1",
+    "partition_wise_fileformat4",
+    "partition_wise_fileformat5",
+    "partition_wise_fileformat6",
+    "partition_wise_fileformat7",
+    "rename_column",
+
+    // The following fails due to describe extended.
+    "alter3",
+    "alter5",
+    "alter_table_serde",
+    "input_part10",
+    "input_part10_win",
+    "inputddl6",
+    "inputddl7",
+    "part_inherit_tbl_props_empty",
+    "serde_reported_schema",
+    "stats0",
+    "stats_empty_partition",
+    "unicode_notation",
+    "union_remove_11",
+    "union_remove_3",
+
+    // The following fails due to alter table partitions with predicate.
+    "drop_partitions_filter",
+    "drop_partitions_filter2",
+    "drop_partitions_filter3",
+
+    // The following fails due to truncate table
+    "truncate_table",
+
+    // We do not support DFS command.
+    // We have converted the useful parts of these tests to tests
+    // in org.apache.spark.sql.hive.execution.SQLQuerySuite.
+    "drop_database_removes_partition_dirs",
+    "drop_table_removes_partition_dirs",
+
+    // These tests use EXPLAIN FORMATTED, which is not supported
+    "input4",
+    "join0",
+    "plan_json",
+
+    // This test uses CREATE EXTERNAL TABLE without specifying LOCATION
+    "alter2",
+
+    // [SPARK-16248][SQL] Include the list of Hive fallback functions
+    "udf_field",
+    "udf_reflect2",
+    "udf_xpath",
+    "udf_xpath_boolean",
+    "udf_xpath_double",
+    "udf_xpath_float",
+    "udf_xpath_int",
+    "udf_xpath_long",
+    "udf_xpath_short",
+    "udf_xpath_string",
+
+    // These tests DROP TABLE that don't exist (but do not specify IF EXISTS)
+    "alter_rename_partition1",
+    "date_1",
+    "date_4",
+    "date_join1",
+    "date_serde",
+    "insert_compressed",
+    "lateral_view_cp",
+    "leftsemijoin",
+    "mapjoin_subquery2",
+    "nomore_ambiguous_table_col",
+    "partition_date",
+    "partition_varchar1",
+    "ppd_repeated_alias",
+    "push_or",
+    "reducesink_dedup",
+    "subquery_in",
+    "subquery_notin_having",
+    "timestamp_3",
+    "timestamp_lazy",
+    "udaf_covar_pop",
+    "union31",
+    "union_date",
+    "varchar_2",
+    "varchar_join1",
+
+    // This test assumes we parse scientific decimals as doubles (we parse them as decimals)
+    "literal_double",
+
+    // These tests are duplicates of joinXYZ
+    "auto_join0",
+    "auto_join1",
+    "auto_join10",
+    "auto_join11",
+    "auto_join12",
+    "auto_join13",
+    "auto_join14",
+    "auto_join14_hadoop20",
+    "auto_join15",
+    "auto_join17",
+    "auto_join18",
+    "auto_join2",
+    "auto_join20",
+    "auto_join21",
+    "auto_join23",
+    "auto_join24",
+    "auto_join3",
+    "auto_join4",
+    "auto_join5",
+    "auto_join6",
+    "auto_join7",
+    "auto_join8",
+    "auto_join9",
+
+    // These tests are based on the Hive's hash function, which is different from Spark
+    "auto_join19",
+    "auto_join22",
+    "auto_join25",
+    "auto_join26",
+    "auto_join27",
+    "auto_join28",
+    "auto_join30",
+    "auto_join31",
+    "auto_join_nulls",
+    "auto_join_reordering_values",
+    "correlationoptimizer1",
+    "correlationoptimizer2",
+    "correlationoptimizer3",
+    "correlationoptimizer4",
+    "multiMapJoin1",
+    "orc_dictionary_threshold",
+    "udf_hash",
+    // Moved to HiveQuerySuite
+    "udf_radians"
+  )
+
+  private def commonIncludeList = Seq(
+    "add_part_exist",
+    "add_part_multiple",
+    "add_partition_no_whitelist",
+    "add_partition_with_whitelist",
+    "alias_casted_column",
+    "alter_partition_with_whitelist",
+    "ambiguous_col",
+    "annotate_stats_join",
+    "annotate_stats_limit",
+    "annotate_stats_part",
+    "annotate_stats_table",
+    "annotate_stats_union",
     "binary_constant",
     "binarysortable_1",
     "cast1",
@@ -405,15 +634,11 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "compute_stats_long",
     "compute_stats_string",
     "convert_enum_to_string",
-    "correlationoptimizer1",
     "correlationoptimizer10",
     "correlationoptimizer11",
     "correlationoptimizer13",
     "correlationoptimizer14",
     "correlationoptimizer15",
-    "correlationoptimizer2",
-    "correlationoptimizer3",
-    "correlationoptimizer4",
     "correlationoptimizer6",
     "correlationoptimizer7",
     "correlationoptimizer8",
@@ -421,57 +646,35 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "count",
     "cp_mj_rc",
     "create_insert_outputformat",
-    "create_like_tbl_props",
-    "create_like_view",
     "create_nested_type",
-    "create_skewed_table1",
     "create_struct_table",
     "create_view_translate",
     "cross_join",
     "cross_product_check_1",
     "cross_product_check_2",
-    "ct_case_insensitive",
     "database_drop",
     "database_location",
     "database_properties",
-    "date_1",
     "date_2",
-    "date_3",
-    "date_4",
     "date_comparison",
-    "date_join1",
-    "date_serde",
     "decimal_1",
     "decimal_4",
     "decimal_join",
     "default_partition_name",
     "delimiter",
     "desc_non_existent_tbl",
-    "describe_formatted_view_partitioned",
-    "diff_part_input_formats",
     "disable_file_format_check",
-    "disallow_incompatible_type_change_off",
     "distinct_stats",
-    "drop_database_removes_partition_dirs",
     "drop_function",
-    "drop_index",
-    "drop_index_removes_partition_dirs",
     "drop_multi_partitions",
-    "drop_partitions_filter",
-    "drop_partitions_filter2",
-    "drop_partitions_filter3",
-    "drop_partitions_ignore_protection",
     "drop_table",
     "drop_table2",
-    "drop_table_removes_partition_dirs",
     "drop_view",
     "dynamic_partition_skip_default",
     "escape_clusterby1",
     "escape_distributeby1",
     "escape_orderby1",
     "escape_sortby1",
-    "explain_rearrange",
-    "fileformat_mix",
     "fileformat_sequencefile",
     "fileformat_text",
     "filter_join_breaktask",
@@ -480,9 +683,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "groupby11",
     "groupby12",
     "groupby1_limit",
-    "groupby_grouping_id1",
-    "groupby_grouping_id2",
-    "groupby_grouping_sets1",
     "groupby_grouping_sets2",
     "groupby_grouping_sets3",
     "groupby_grouping_sets4",
@@ -524,26 +724,16 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "groupby_multi_insert_common_distinct",
     "groupby_multi_single_reducer2",
     "groupby_multi_single_reducer3",
-    "groupby_mutli_insert_common_distinct",
+    "groupby_multi_insert_common_distinct",
     "groupby_neg_float",
     "groupby_ppd",
     "groupby_ppr",
-    "groupby_sort_10",
-    "groupby_sort_2",
-    "groupby_sort_3",
-    "groupby_sort_4",
-    "groupby_sort_5",
     "groupby_sort_6",
-    "groupby_sort_7",
-    "groupby_sort_8",
-    "groupby_sort_9",
-    "groupby_sort_test_1",
     "having",
     "implicit_cast1",
     "index_serde",
     "infer_bucket_sort_dyn_part",
     "innerjoin",
-    "inoutdriver",
     "input",
     "input0",
     "input1",
@@ -565,8 +755,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "input26",
     "input28",
     "input2_limit",
-    "input3",
-    "input4",
     "input40",
     "input41",
     "input49",
@@ -578,8 +766,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "input_limit",
     "input_part0",
     "input_part1",
-    "input_part10",
-    "input_part10_win",
     "input_part2",
     "input_part3",
     "input_part4",
@@ -592,16 +778,10 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "inputddl1",
     "inputddl2",
     "inputddl3",
-    "inputddl4",
-    "inputddl5",
-    "inputddl6",
-    "inputddl7",
     "inputddl8",
     "insert1",
     "insert1_overwrite_partitions",
     "insert2_overwrite_partitions",
-    "insert_compressed",
-    "join0",
     "join1",
     "join10",
     "join11",
@@ -649,25 +829,19 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "join_array",
     "join_casesensitive",
     "join_empty",
-    "join_filters",
     "join_hive_626",
     "join_map_ppr",
-    "join_nulls",
-    "join_nullsafe",
     "join_rc",
     "join_reorder2",
     "join_reorder3",
     "join_reorder4",
     "join_star",
     "lateral_view",
-    "lateral_view_cp",
     "lateral_view_noalias",
     "lateral_view_ppd",
-    "leftsemijoin",
     "leftsemijoin_mr",
     "limit_pushdown_negative",
     "lineage1",
-    "literal_double",
     "literal_ints",
     "literal_string",
     "load_dyn_part1",
@@ -677,7 +851,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "load_dyn_part13",
     "load_dyn_part14",
     "load_dyn_part14_win",
-    "load_dyn_part2",
     "load_dyn_part3",
     "load_dyn_part4",
     "load_dyn_part5",
@@ -688,12 +861,10 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "load_file_with_space_in_the_name",
     "loadpart1",
     "louter_join_ppr",
-    "macro",
     "mapjoin_distinct",
     "mapjoin_filter_on_outerjoin",
     "mapjoin_mapjoin",
     "mapjoin_subquery",
-    "mapjoin_subquery2",
     "mapjoin_test_outer",
     "mapreduce1",
     "mapreduce2",
@@ -707,7 +878,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "merge2",
     "merge4",
     "mergejoins",
-    "multiMapJoin1",
     "multiMapJoin2",
     "multi_insert_gby",
     "multi_insert_gby3",
@@ -715,7 +885,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "multi_join_union",
     "multigroupby_singlemr",
     "noalias_subq1",
-    "nomore_ambiguous_table_col",
     "nonblock_op_deduplicate",
     "notable_alias1",
     "notable_alias2",
@@ -730,28 +899,17 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "nullinput2",
     "nullscript",
     "optional_outer",
-    "orc_dictionary_threshold",
-    "orc_empty_files",
     "order",
     "order2",
     "outer_join_ppr",
     "parallel",
     "parenthesis_star_by",
     "part_inherit_tbl_props",
-    "part_inherit_tbl_props_empty",
     "part_inherit_tbl_props_with_star",
     "partcols1",
-    "partition_date",
-    "partition_schema1",
     "partition_serde_format",
     "partition_type_check",
-    "partition_varchar1",
-    "partition_wise_fileformat4",
-    "partition_wise_fileformat5",
-    "partition_wise_fileformat6",
-    "partition_wise_fileformat7",
     "partition_wise_fileformat9",
-    "plan_json",
     "ppd1",
     "ppd2",
     "ppd_clusterby",
@@ -770,7 +928,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "ppd_outer_join4",
     "ppd_outer_join5",
     "ppd_random",
-    "ppd_repeated_alias",
     "ppd_udf_col",
     "ppd_union",
     "ppr_allchildsarenull",
@@ -778,8 +935,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "ppr_pushdown2",
     "ppr_pushdown3",
     "progress_1",
-    "protectmode",
-    "push_or",
     "query_with_semi",
     "quote1",
     "quote2",
@@ -788,12 +943,9 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "rcfile_null_value",
     "rcfile_toleratecorruptions",
     "rcfile_union",
-    "reduce_deduplicate",
     "reduce_deduplicate_exclude_gby",
     "reduce_deduplicate_exclude_join",
     "reduce_deduplicate_extended",
-    "reducesink_dedup",
-    "rename_column",
     "router_join_ppr",
     "select_as_omitted",
     "select_unquote_and",
@@ -802,68 +954,29 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "semicolon",
     "semijoin",
     "serde_regex",
-    "serde_reported_schema",
     "set_variable_sub",
     "show_columns",
-    "show_create_table_alter",
-    "show_create_table_db_table",
-    "show_create_table_delimited",
-    "show_create_table_does_not_exist",
-    "show_create_table_index",
-    "show_create_table_partitioned",
-    "show_create_table_serde",
-    "show_create_table_view",
     "show_describe_func_quotes",
     "show_functions",
     "show_partitions",
     "show_tblproperties",
-    "skewjoinopt13",
-    "skewjoinopt18",
-    "skewjoinopt9",
-    "smb_mapjoin9",
-    "smb_mapjoin_1",
-    "smb_mapjoin_10",
-    "smb_mapjoin_13",
-    "smb_mapjoin_14",
-    "smb_mapjoin_15",
-    "smb_mapjoin_16",
-    "smb_mapjoin_17",
-    "smb_mapjoin_2",
-    "smb_mapjoin_21",
-    "smb_mapjoin_25",
-    "smb_mapjoin_3",
-    "smb_mapjoin_4",
-    "smb_mapjoin_5",
-    "smb_mapjoin_6",
-    "smb_mapjoin_7",
-    "smb_mapjoin_8",
     "sort",
-    "sort_merge_join_desc_1",
-    "sort_merge_join_desc_2",
-    "sort_merge_join_desc_3",
-    "sort_merge_join_desc_4",
-    "sort_merge_join_desc_5",
-    "sort_merge_join_desc_6",
-    "sort_merge_join_desc_7",
-    "stats0",
     "stats_aggregator_error_1",
-    "stats_empty_partition",
     "stats_publisher_error_1",
     "subq2",
+    "subquery_exists",
+    "subquery_exists_having",
+    "subquery_nonexistent",
+    "subquery_nonexistent_having",
+    "subquery_in_having",
     "tablename_with_select",
-    "timestamp_3",
     "timestamp_comparison",
-    "timestamp_lazy",
     "timestamp_null",
-    "touch",
     "transform_ppr1",
     "transform_ppr2",
-    "truncate_table",
     "type_cast_1",
     "type_widening",
     "udaf_collect_set",
-    "udaf_covar_pop",
-    "udaf_covar_samp",
     "udaf_histogram_numeric",
     "udf2",
     "udf5",
@@ -873,11 +986,10 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "udf_10_trims",
     "udf_E",
     "udf_PI",
-    "udf_abs",
     "udf_acos",
     "udf_add",
-    "udf_array",
-    "udf_array_contains",
+    // "udf_array",  -- done in array.sql
+    // "udf_array_contains",  -- done in array.sql
     "udf_ascii",
     "udf_asin",
     "udf_atan",
@@ -913,15 +1025,12 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "udf_elt",
     "udf_equal",
     "udf_exp",
-    "udf_field",
     "udf_find_in_set",
     "udf_float",
     "udf_floor",
-    "udf_format_number",
     "udf_from_unixtime",
     "udf_greaterthan",
     "udf_greaterthanorequal",
-    "udf_hash",
     "udf_hex",
     "udf_if",
     "udf_index",
@@ -957,16 +1066,12 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "udf_positive",
     "udf_pow",
     "udf_power",
-    "udf_radians",
     "udf_rand",
-    "udf_reflect2",
     "udf_regexp",
     "udf_regexp_extract",
     "udf_regexp_replace",
     "udf_repeat",
     "udf_rlike",
-    "udf_round",
-    "udf_round_3",
     "udf_rpad",
     "udf_rtrim",
     "udf_sign",
@@ -1002,15 +1107,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "udf_variance",
     "udf_weekofyear",
     "udf_when",
-    "udf_xpath",
-    "udf_xpath_boolean",
-    "udf_xpath_double",
-    "udf_xpath_float",
-    "udf_xpath_int",
-    "udf_xpath_long",
-    "udf_xpath_short",
-    "udf_xpath_string",
-    "unicode_notation",
     "union10",
     "union11",
     "union13",
@@ -1032,7 +1128,6 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "union29",
     "union3",
     "union30",
-    "union31",
     "union33",
     "union34",
     "union4",
@@ -1041,18 +1136,22 @@ class HiveCompatibilitySuite extends HiveQueryFileTest with BeforeAndAfter {
     "union7",
     "union8",
     "union9",
-    "union_date",
     "union_lateralview",
     "union_ppr",
-    "union_remove_11",
-    "union_remove_3",
     "union_remove_6",
     "union_script",
-    "varchar_2",
-    "varchar_join1",
     "varchar_union1",
     "view",
     "view_cast",
     "view_inputs"
   )
+
+  /**
+   * The set of tests that are believed to be working in catalyst. Tests not on includeList or
+   * excludeList are implicitly marked as ignored.
+   */
+  override def includeList: Seq[String] =
+    commonIncludeList ++ Seq(
+      "decimal_1_1"
+    )
 }

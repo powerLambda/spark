@@ -18,10 +18,9 @@
 // scalastyle:off println
 package org.apache.spark.examples.mllib
 
+import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.mllib.random.RandomRDDs
 import org.apache.spark.rdd.RDD
-
-import org.apache.spark.{SparkConf, SparkContext}
 
 /**
  * An example app for randomly generated RDDs. Run with
@@ -32,7 +31,7 @@ import org.apache.spark.{SparkConf, SparkContext}
  */
 object RandomRDDGeneration {
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
 
     val conf = new SparkConf().setAppName(s"RandomRDDGeneration")
     val sc = new SparkContext(conf)

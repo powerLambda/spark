@@ -23,9 +23,10 @@ import javax.annotation.concurrent.GuardedBy
 
 import scala.util.control.NonFatal
 
-import org.apache.spark.{Logging, SparkException}
+import org.apache.spark.SparkException
+import org.apache.spark.internal.Logging
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
-import org.apache.spark.rpc.RpcAddress
+import org.apache.spark.rpc.{RpcAddress, RpcEnvStoppedException}
 
 private[netty] sealed trait OutboxMessage {
 
@@ -43,7 +44,10 @@ private[netty] case class OneWayOutboxMessage(content: ByteBuffer) extends Outbo
   }
 
   override def onFailure(e: Throwable): Unit = {
-    logWarning(s"Failed to send one-way RPC.", e)
+    e match {
+      case e1: RpcEnvStoppedException => logDebug(e1.getMessage)
+      case e1: Throwable => logWarning(s"Failed to send one-way RPC.", e1)
+    }
   }
 
 }
@@ -52,7 +56,7 @@ private[netty] case class RpcOutboxMessage(
     content: ByteBuffer,
     _onFailure: (Throwable) => Unit,
     _onSuccess: (TransportClient, ByteBuffer) => Unit)
-  extends OutboxMessage with RpcResponseCallback {
+  extends OutboxMessage with RpcResponseCallback with Logging {
 
   private var client: TransportClient = _
   private var requestId: Long = _
@@ -62,9 +66,20 @@ private[netty] case class RpcOutboxMessage(
     this.requestId = client.sendRpc(content, this)
   }
 
+  private[netty] def removeRpcRequest(): Unit = {
+    if (client != null) {
+      client.removeRpcRequest(requestId)
+    } else {
+      logError("Ask terminated before connecting successfully")
+    }
+  }
+
   def onTimeout(): Unit = {
-    require(client != null, "TransportClient has not yet been set.")
-    client.removeRpcRequest(requestId)
+    removeRpcRequest()
+  }
+
+  def onAbort(): Unit = {
+    removeRpcRequest()
   }
 
   override def onFailure(e: Throwable): Unit = {
@@ -159,7 +174,7 @@ private[netty] class Outbox(nettyEnv: NettyRpcEnv, val address: RpcAddress) {
         if (_client != null) {
           message.sendWith(_client)
         } else {
-          assert(stopped == true)
+          assert(stopped)
         }
       } catch {
         case NonFatal(e) =>
@@ -237,10 +252,7 @@ private[netty] class Outbox(nettyEnv: NettyRpcEnv, val address: RpcAddress) {
   }
 
   private def closeClient(): Unit = synchronized {
-    // Not sure if `client.close` is idempotent. Just for safety.
-    if (client != null) {
-      client.close()
-    }
+    // Just set client to null. Don't close it in order to reuse the connection.
     client = null
   }
 

@@ -18,50 +18,41 @@
 package org.apache.spark.streaming
 
 import java.io.File
+import java.util.concurrent.ConcurrentLinkedQueue
 
-import scala.collection.mutable.{ArrayBuffer, SynchronizedBuffer}
+import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 
 import org.scalatest.PrivateMethodTester._
-import org.scalatest.{BeforeAndAfter, BeforeAndAfterAll}
 
+import org.apache.spark.{SparkConf, SparkContext, SparkFunSuite}
 import org.apache.spark.streaming.dstream.{DStream, InternalMapWithStateDStream, MapWithStateDStream, MapWithStateDStreamImpl}
 import org.apache.spark.util.{ManualClock, Utils}
-import org.apache.spark.{SparkConf, SparkContext, SparkFunSuite}
 
-class MapWithStateSuite extends SparkFunSuite
-  with DStreamCheckpointTester with BeforeAndAfterAll with BeforeAndAfter {
+class MapWithStateSuite extends SparkFunSuite with LocalStreamingContext
+  with DStreamCheckpointTester {
 
   private var sc: SparkContext = null
   protected var checkpointDir: File = null
   protected val batchDuration = Seconds(1)
 
-  before {
-    StreamingContext.getActive().foreach { _.stop(stopSparkContext = false) }
-    checkpointDir = Utils.createTempDir("checkpoint")
-  }
+  override def beforeEach(): Unit = {
+    super.beforeEach()
 
-  after {
-    if (checkpointDir != null) {
-      Utils.deleteRecursively(checkpointDir)
-    }
-    StreamingContext.getActive().foreach { _.stop(stopSparkContext = false) }
-  }
-
-  override def beforeAll(): Unit = {
-    super.beforeAll()
     val conf = new SparkConf().setMaster("local").setAppName("MapWithStateSuite")
     conf.set("spark.streaming.clock", classOf[ManualClock].getName())
     sc = new SparkContext(conf)
+
+    checkpointDir = Utils.createTempDir(namePrefix = "checkpoint")
   }
 
-  override def afterAll(): Unit = {
+  override def afterEach(): Unit = {
     try {
-      if (sc != null) {
-        sc.stop()
+      if (checkpointDir != null) {
+        Utils.deleteRecursively(checkpointDir)
       }
     } finally {
-      super.afterAll()
+      super.afterEach()
     }
   }
 
@@ -445,7 +436,8 @@ class MapWithStateSuite extends SparkFunSuite
   }
 
   test("mapWithState - checkpoint durations") {
-    val privateMethod = PrivateMethod[InternalMapWithStateDStream[_, _, _, _]]('internalStream)
+    val privateMethod =
+      PrivateMethod[InternalMapWithStateDStream[_, _, _, _]](Symbol("internalStream"))
 
     def testCheckpointDuration(
         batchDuration: Duration,
@@ -517,7 +509,7 @@ class MapWithStateSuite extends SparkFunSuite
 
       val mapWithStateStream = dstream.map { _ -> 1 }.mapWithState(
         StateSpec.function(runningCount))
-      // Set internval make sure there is one RDD checkpointing
+      // Set interval make sure there is one RDD checkpointing
       mapWithStateStream.checkpoint(checkpointDuration)
       mapWithStateStream.stateSnapshots()
     }
@@ -549,12 +541,12 @@ class MapWithStateSuite extends SparkFunSuite
     // Setup the stream computation
     val ssc = new StreamingContext(sc, Seconds(1))
     val inputStream = new TestInputStream(ssc, input, numPartitions = 2)
-    val trackeStateStream = inputStream.map(x => (x, 1)).mapWithState(mapWithStateSpec)
-    val collectedOutputs = new ArrayBuffer[Seq[T]] with SynchronizedBuffer[Seq[T]]
-    val outputStream = new TestOutputStream(trackeStateStream, collectedOutputs)
-    val collectedStateSnapshots = new ArrayBuffer[Seq[(K, S)]] with SynchronizedBuffer[Seq[(K, S)]]
+    val trackedStateStream = inputStream.map(x => (x, 1)).mapWithState(mapWithStateSpec)
+    val collectedOutputs = new ConcurrentLinkedQueue[Seq[T]]
+    val outputStream = new TestOutputStream(trackedStateStream, collectedOutputs)
+    val collectedStateSnapshots = new ConcurrentLinkedQueue[Seq[(K, S)]]
     val stateSnapshotStream = new TestOutputStream(
-      trackeStateStream.stateSnapshots(), collectedStateSnapshots)
+      trackedStateStream.stateSnapshots(), collectedStateSnapshots)
     outputStream.register()
     stateSnapshotStream.register()
 
@@ -567,10 +559,10 @@ class MapWithStateSuite extends SparkFunSuite
 
     batchCounter.waitUntilBatchesCompleted(numBatches, 10000)
     ssc.stop(stopSparkContext = false)
-    (collectedOutputs, collectedStateSnapshots)
+    (collectedOutputs.asScala.toSeq, collectedStateSnapshots.asScala.toSeq)
   }
 
-  private def assert[U](expected: Seq[Seq[U]], collected: Seq[Seq[U]], typ: String) {
+  private def assert[U](expected: Seq[Seq[U]], collected: Seq[Seq[U]], typ: String): Unit = {
     val debugString = "\nExpected:\n" + expected.mkString("\n") +
       "\nCollected:\n" + collected.mkString("\n")
     assert(expected.size === collected.size,
@@ -583,4 +575,3 @@ class MapWithStateSuite extends SparkFunSuite
     }
   }
 }
-

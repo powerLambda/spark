@@ -1,61 +1,77 @@
 # Apache Spark
 
-Spark is a fast and general cluster computing system for Big Data. It provides
+Spark is a unified analytics engine for large-scale data processing. It provides
 high-level APIs in Scala, Java, Python, and R, and an optimized engine that
 supports general computation graphs for data analysis. It also supports a
 rich set of higher-level tools including Spark SQL for SQL and DataFrames,
-MLlib for machine learning, GraphX for graph processing,
-and Spark Streaming for stream processing.
+pandas API on Spark for pandas workloads, MLlib for machine learning, GraphX for graph processing,
+and Structured Streaming for stream processing.
 
-<http://spark.apache.org/>
+<https://spark.apache.org/>
+
+[![GitHub Action Build](https://github.com/apache/spark/actions/workflows/build_and_test.yml/badge.svg?branch=master&event=push)](https://github.com/apache/spark/actions/workflows/build_and_test.yml?query=branch%3Amaster+event%3Apush)
+[![AppVeyor Build](https://img.shields.io/appveyor/ci/ApacheSoftwareFoundation/spark/master.svg?style=plastic&logo=appveyor)](https://ci.appveyor.com/project/ApacheSoftwareFoundation/spark)
+[![PySpark Coverage](https://codecov.io/gh/apache/spark/branch/master/graph/badge.svg)](https://codecov.io/gh/apache/spark)
 
 
 ## Online Documentation
 
 You can find the latest Spark documentation, including a programming
-guide, on the [project web page](http://spark.apache.org/documentation.html)
-and [project wiki](https://cwiki.apache.org/confluence/display/SPARK).
+guide, on the [project web page](https://spark.apache.org/documentation.html).
 This README file only contains basic setup instructions.
 
 ## Building Spark
 
-Spark is built using [Apache Maven](http://maven.apache.org/).
+Spark is built using [Apache Maven](https://maven.apache.org/).
 To build Spark and its example programs, run:
 
-    build/mvn -DskipTests clean package
+```bash
+./build/mvn -DskipTests clean package
+```
 
 (You do not need to do this if you downloaded a pre-built package.)
+
 More detailed documentation is available from the project site, at
-["Building Spark"](http://spark.apache.org/docs/latest/building-spark.html).
-For developing Spark using an IDE, see [Eclipse](https://cwiki.apache.org/confluence/display/SPARK/Useful+Developer+Tools#UsefulDeveloperTools-Eclipse)
-and [IntelliJ](https://cwiki.apache.org/confluence/display/SPARK/Useful+Developer+Tools#UsefulDeveloperTools-IntelliJ).
+["Building Spark"](https://spark.apache.org/docs/latest/building-spark.html).
+
+For general development tips, including info on developing Spark using an IDE, see ["Useful Developer Tools"](https://spark.apache.org/developer-tools.html).
 
 ## Interactive Scala Shell
 
 The easiest way to start using Spark is through the Scala shell:
 
-    ./bin/spark-shell
+```bash
+./bin/spark-shell
+```
 
-Try the following command, which should return 1000:
+Try the following command, which should return 1,000,000,000:
 
-    scala> sc.parallelize(1 to 1000).count()
+```scala
+scala> spark.range(1000 * 1000 * 1000).count()
+```
 
 ## Interactive Python Shell
 
 Alternatively, if you prefer Python, you can use the Python shell:
 
-    ./bin/pyspark
+```bash
+./bin/pyspark
+```
 
-And run the following command, which should also return 1000:
+And run the following command, which should also return 1,000,000,000:
 
-    >>> sc.parallelize(range(1000)).count()
+```python
+>>> spark.range(1000 * 1000 * 1000).count()
+```
 
 ## Example Programs
 
 Spark also comes with several sample programs in the `examples` directory.
 To run one of them, use `./bin/run-example <class> [params]`. For example:
 
-    ./bin/run-example SparkPi
+```bash
+./bin/run-example SparkPi
+```
 
 will run the Pi example locally.
 
@@ -66,7 +82,9 @@ locally with one thread, or "local[N]" to run locally with N threads. You
 can also use an abbreviated class name if the class is in the `examples`
 package. For instance:
 
-    MASTER=spark://host:7077 ./bin/run-example SparkPi
+```bash
+MASTER=spark://host:7077 ./bin/run-example SparkPi
+```
 
 Many of the example programs print usage help if no params are given.
 
@@ -75,10 +93,14 @@ Many of the example programs print usage help if no params are given.
 Testing first requires [building Spark](#building-spark). Once Spark is built, tests
 can be run using:
 
-    ./dev/run-tests
+```bash
+./dev/run-tests
+```
 
 Please see the guidance on how to
-[run tests for a module, or individual tests](https://cwiki.apache.org/confluence/display/SPARK/Useful+Developer+Tools).
+[run tests for a module, or individual tests](https://spark.apache.org/developer-tools.html#individual-tests).
+
+There is also a Kubernetes integration test, see resource-managers/kubernetes/integration-tests/README.md
 
 ## A Note About Hadoop Versions
 
@@ -87,11 +109,16 @@ storage systems. Because the protocols have changed in different versions of
 Hadoop, you must build Spark against the same version that your cluster runs.
 
 Please refer to the build documentation at
-["Specifying the Hadoop Version"](http://spark.apache.org/docs/latest/building-spark.html#specifying-the-hadoop-version)
+["Specifying the Hadoop Version and Enabling YARN"](https://spark.apache.org/docs/latest/building-spark.html#specifying-the-hadoop-version-and-enabling-yarn)
 for detailed guidance on building for a particular distribution of Hadoop, including
 building for particular Hive and Hive Thriftserver distributions.
 
 ## Configuration
 
-Please refer to the [Configuration Guide](http://spark.apache.org/docs/latest/configuration.html)
+Please refer to the [Configuration Guide](https://spark.apache.org/docs/latest/configuration.html)
 in the online documentation for an overview on how to configure Spark.
+
+## Contributing
+
+Please review the [Contribution to Spark guide](https://spark.apache.org/contributing.html)
+for information on how to get started contributing to the project.

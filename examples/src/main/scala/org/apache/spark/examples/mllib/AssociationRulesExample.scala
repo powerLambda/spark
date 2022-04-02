@@ -18,16 +18,15 @@
 // scalastyle:off println
 package org.apache.spark.examples.mllib
 
+import org.apache.spark.{SparkConf, SparkContext}
 // $example on$
 import org.apache.spark.mllib.fpm.AssociationRules
 import org.apache.spark.mllib.fpm.FPGrowth.FreqItemset
 // $example off$
 
-import org.apache.spark.{SparkConf, SparkContext}
-
 object AssociationRulesExample {
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     val conf = new SparkConf().setAppName("AssociationRulesExample")
     val sc = new SparkContext(conf)
 
@@ -43,12 +42,14 @@ object AssociationRulesExample {
     val results = ar.run(freqItemsets)
 
     results.collect().foreach { rule =>
-      println("[" + rule.antecedent.mkString(",")
-        + "=>"
-        + rule.consequent.mkString(",") + "]," + rule.confidence)
+    println(s"[${rule.antecedent.mkString(",")}=>${rule.consequent.mkString(",")} ]" +
+        s" ${rule.confidence}")
     }
     // $example off$
+
+    sc.stop()
   }
 
 }
 // scalastyle:on println
+

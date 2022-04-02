@@ -25,8 +25,10 @@ import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 class GenericArrayData(val array: Array[Any]) extends ArrayData {
 
-  def this(seq: Seq[Any]) = this(seq.toArray)
-  def this(list: java.util.List[Any]) = this(list.asScala)
+  // Specified this as`scala.collection.Seq` because seqOrArray can be
+  // `mutable.ArraySeq` in Scala 2.13
+  def this(seq: scala.collection.Seq[Any]) = this(seq.toArray)
+  def this(list: java.util.List[Any]) = this(list.asScala.toSeq)
 
   // TODO: This is boxing.  We should specialize.
   def this(primitiveArray: Array[Int]) = this(primitiveArray.toSeq)
@@ -37,7 +39,23 @@ class GenericArrayData(val array: Array[Any]) extends ArrayData {
   def this(primitiveArray: Array[Byte]) = this(primitiveArray.toSeq)
   def this(primitiveArray: Array[Boolean]) = this(primitiveArray.toSeq)
 
-  override def copy(): ArrayData = new GenericArrayData(array.clone())
+  def this(seqOrArray: Any) = this(seqOrArray match {
+    // Specified this as`scala.collection.Seq` because seqOrArray can be
+    // `mutable.ArraySeq` in Scala 2.13
+    case seq: scala.collection.Seq[Any] => seq.toArray
+    case array: Array[Any] => array  // array of objects, so no need to convert
+    case array: Array[_] => array.toSeq.toArray[Any] // array of primitives, so box them
+  })
+
+  override def copy(): ArrayData = {
+    val newValues = new Array[Any](array.length)
+    var i = 0
+    while (i < array.length) {
+      newValues(i) = InternalRow.copyValue(array(i))
+      i += 1
+    }
+    new GenericArrayData(newValues)
+  }
 
   override def numElements(): Int = array.length
 
@@ -58,6 +76,10 @@ class GenericArrayData(val array: Array[Any]) extends ArrayData {
   override def getStruct(ordinal: Int, numFields: Int): InternalRow = getAs(ordinal)
   override def getArray(ordinal: Int): ArrayData = getAs(ordinal)
   override def getMap(ordinal: Int): MapData = getAs(ordinal)
+
+  override def setNullAt(ordinal: Int): Unit = array(ordinal) = null
+
+  override def update(ordinal: Int, value: Any): Unit = array(ordinal) = value
 
   override def toString(): String = array.mkString("[", ",", "]")
 
@@ -98,7 +120,7 @@ class GenericArrayData(val array: Array[Any]) extends ArrayData {
             if (!o2.isInstanceOf[Double] || ! java.lang.Double.isNaN(o2.asInstanceOf[Double])) {
               return false
             }
-          case _ => if (o1 != o2) {
+          case _ => if (o1.getClass != o2.getClass || o1 != o2) {
             return false
           }
         }

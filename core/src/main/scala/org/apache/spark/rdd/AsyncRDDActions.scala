@@ -20,10 +20,11 @@ package org.apache.spark.rdd
 import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.{Future, ExecutionContext}
+import scala.concurrent.{ExecutionContext, Future}
 import scala.reflect.ClassTag
 
-import org.apache.spark.{JobSubmitter, ComplexFutureAction, FutureAction, Logging}
+import org.apache.spark.{ComplexFutureAction, FutureAction, JobSubmitter}
+import org.apache.spark.internal.Logging
 import org.apache.spark.util.ThreadUtils
 
 /**
@@ -68,7 +69,7 @@ class AsyncRDDActions[T: ClassTag](self: RDD[T]) extends Serializable with Loggi
     val localProperties = self.context.getLocalProperties
     // Cached thread pool to handle aggregation of subtasks.
     implicit val executionContext = AsyncRDDActions.futureExecutionContext
-    val results = new ArrayBuffer[T](num)
+    val results = new ArrayBuffer[T]
     val totalParts = self.partitions.length
 
     /*
@@ -77,29 +78,29 @@ class AsyncRDDActions[T: ClassTag](self: RDD[T]) extends Serializable with Loggi
       This implementation is non-blocking, asynchronously handling the
       results of each job and triggering the next job using callbacks on futures.
      */
-    def continue(partsScanned: Int)(implicit jobSubmitter: JobSubmitter) : Future[Seq[T]] =
+    def continue(partsScanned: Int)(implicit jobSubmitter: JobSubmitter): Future[Seq[T]] =
       if (results.size >= num || partsScanned >= totalParts) {
         Future.successful(results.toSeq)
       } else {
         // The number of partitions to try in this iteration. It is ok for this number to be
         // greater than totalParts because we actually cap it at totalParts in runJob.
-        var numPartsToTry = 1
+        var numPartsToTry = 1L
         if (partsScanned > 0) {
           // If we didn't find any rows after the previous iteration, quadruple and retry.
           // Otherwise, interpolate the number of partitions we need to try, but overestimate it
           // by 50%. We also cap the estimation in the end.
           if (results.size == 0) {
-            numPartsToTry = partsScanned * 4
+            numPartsToTry = partsScanned * 4L
           } else {
             // the left side of max is >=1 whenever partsScanned >= 2
             numPartsToTry = Math.max(1,
               (1.5 * num * partsScanned / results.size).toInt - partsScanned)
-            numPartsToTry = Math.min(numPartsToTry, partsScanned * 4)
+            numPartsToTry = Math.min(numPartsToTry, partsScanned * 4L)
           }
         }
 
         val left = num - results.size
-        val p = partsScanned until math.min(partsScanned + numPartsToTry, totalParts)
+        val p = partsScanned.until(math.min(partsScanned + numPartsToTry, totalParts).toInt)
 
         val buf = new Array[Array[T]](p.size)
         self.context.setCallSite(callSite)
@@ -108,10 +109,10 @@ class AsyncRDDActions[T: ClassTag](self: RDD[T]) extends Serializable with Loggi
           (it: Iterator[T]) => it.take(left).toArray,
           p,
           (index: Int, data: Array[T]) => buf(index) = data,
-          Unit)
-        job.flatMap {_ =>
+          ())
+        job.flatMap { _ =>
           buf.foreach(results ++= _.take(num - results.size))
-          continue(partsScanned + numPartsToTry)
+          continue(partsScanned + p.size)
         }
       }
 
@@ -124,7 +125,7 @@ class AsyncRDDActions[T: ClassTag](self: RDD[T]) extends Serializable with Loggi
   def foreachAsync(f: T => Unit): FutureAction[Unit] = self.withScope {
     val cleanF = self.context.clean(f)
     self.context.submitJob[T, Unit, Unit](self, _.foreach(cleanF), Range(0, self.partitions.length),
-      (index, data) => Unit, Unit)
+      (index, data) => (), ())
   }
 
   /**
@@ -132,7 +133,7 @@ class AsyncRDDActions[T: ClassTag](self: RDD[T]) extends Serializable with Loggi
    */
   def foreachPartitionAsync(f: Iterator[T] => Unit): FutureAction[Unit] = self.withScope {
     self.context.submitJob[T, Unit, Unit](self, f, Range(0, self.partitions.length),
-      (index, data) => Unit, Unit)
+      (index, data) => (), ())
   }
 }
 

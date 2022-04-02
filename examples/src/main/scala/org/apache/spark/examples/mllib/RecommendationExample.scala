@@ -18,7 +18,7 @@
 // scalastyle:off println
 package org.apache.spark.examples.mllib
 
-import org.apache.spark.{SparkContext, SparkConf}
+import org.apache.spark.{SparkConf, SparkContext}
 // $example on$
 import org.apache.spark.mllib.recommendation.ALS
 import org.apache.spark.mllib.recommendation.MatrixFactorizationModel
@@ -56,12 +56,14 @@ object RecommendationExample {
       val err = (r1 - r2)
       err * err
     }.mean()
-    println("Mean Squared Error = " + MSE)
+    println(s"Mean Squared Error = $MSE")
 
     // Save and load model
     model.save(sc, "target/tmp/myCollaborativeFilter")
     val sameModel = MatrixFactorizationModel.load(sc, "target/tmp/myCollaborativeFilter")
     // $example off$
+
+    sc.stop()
   }
 }
 // scalastyle:on println

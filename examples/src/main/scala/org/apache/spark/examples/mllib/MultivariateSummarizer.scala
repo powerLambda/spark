@@ -20,11 +20,10 @@ package org.apache.spark.examples.mllib
 
 import scopt.OptionParser
 
+import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.stat.MultivariateOnlineSummarizer
 import org.apache.spark.mllib.util.MLUtils
-import org.apache.spark.{SparkConf, SparkContext}
-
 
 /**
  * An example app for summarizing multivariate data from a file. Run with
@@ -39,7 +38,7 @@ object MultivariateSummarizer {
   case class Params(input: String = "data/mllib/sample_linear_regression_data.txt")
     extends AbstractParams[Params]
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
 
     val defaultParams = Params()
 
@@ -58,14 +57,13 @@ object MultivariateSummarizer {
         """.stripMargin)
     }
 
-    parser.parse(args, defaultParams).map { params =>
-      run(params)
-    } getOrElse {
-        sys.exit(1)
+    parser.parse(args, defaultParams) match {
+      case Some(params) => run(params)
+      case _ => sys.exit(1)
     }
   }
 
-  def run(params: Params) {
+  def run(params: Params): Unit = {
     val conf = new SparkConf().setAppName(s"MultivariateSummarizer with $params")
     val sc = new SparkContext(conf)
 

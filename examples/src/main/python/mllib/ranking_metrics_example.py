@@ -17,7 +17,7 @@
 
 # $example on$
 from pyspark.mllib.recommendation import ALS, Rating
-from pyspark.mllib.evaluation import RegressionMetrics, RankingMetrics
+from pyspark.mllib.evaluation import RegressionMetrics
 # $example off$
 from pyspark import SparkContext
 
@@ -47,7 +47,7 @@ if __name__ == "__main__":
     # Instantiate regression metrics to compare predicted and actual ratings
     metrics = RegressionMetrics(scoreAndLabels)
 
-    # Root mean sqaured error
+    # Root mean squared error
     print("RMSE = %s" % metrics.rootMeanSquaredError)
 
     # R-squared

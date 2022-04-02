@@ -17,11 +17,10 @@
 
 package org.apache.spark.mllib.tree.model
 
-import org.apache.spark.annotation.{DeveloperApi, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.mllib.tree.impurity.ImpurityCalculator
 
 /**
- * :: DeveloperApi ::
  * Information gain statistics for each split
  * @param gain information gain value
  * @param impurity current node impurity
@@ -31,7 +30,6 @@ import org.apache.spark.mllib.tree.impurity.ImpurityCalculator
  * @param rightPredict right node predict
  */
 @Since("1.0.0")
-@DeveloperApi
 class InformationGainStats(
     val gain: Double,
     val impurity: Double,
@@ -68,18 +66,7 @@ class InformationGainStats(
   }
 }
 
-private[spark] object InformationGainStats {
-  /**
-   * An [[org.apache.spark.mllib.tree.model.InformationGainStats]] object to
-   * denote that current split doesn't satisfies minimum info gain or
-   * minimum number of instances per node.
-   */
-  val invalidInformationGainStats = new InformationGainStats(Double.MinValue, -1.0, -1.0, -1.0,
-    new Predict(0.0, 0.0), new Predict(0.0, 0.0))
-}
-
 /**
- * :: DeveloperApi ::
  * Impurity statistics for each split
  * @param gain information gain value
  * @param impurity current node impurity
@@ -89,7 +76,6 @@ private[spark] object InformationGainStats {
  * @param valid whether the current split satisfies minimum info gain or
  *              minimum number of instances per node
  */
-@DeveloperApi
 private[spark] class ImpurityStats(
     val gain: Double,
     val impurity: Double,

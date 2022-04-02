@@ -14,101 +14,179 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from typing import overload, Callable, Optional, TypeVar, Union
 
-from py4j.protocol import Py4JJavaError
-
-from pyspark.serializers import PairDeserializer, NoOpSerializer
+from pyspark.serializers import NoOpSerializer
 from pyspark.storagelevel import StorageLevel
 from pyspark.streaming import DStream
+from pyspark.streaming.context import StreamingContext
+from pyspark.util import _print_missing_jar
 
-__all__ = ['KinesisUtils', 'InitialPositionInStream', 'utf8_decoder']
+
+__all__ = ["KinesisUtils", "InitialPositionInStream", "utf8_decoder"]
+
+T = TypeVar("T")
 
 
-def utf8_decoder(s):
-    """ Decode the unicode as UTF-8 """
+def utf8_decoder(s: Optional[bytes]) -> Optional[str]:
+    """Decode the unicode as UTF-8"""
     if s is None:
         return None
-    return s.decode('utf-8')
+    return s.decode("utf-8")
 
 
-class KinesisUtils(object):
+class KinesisUtils:
+    @staticmethod
+    @overload
+    def createStream(
+        ssc: StreamingContext,
+        kinesisAppName: str,
+        streamName: str,
+        endpointUrl: str,
+        regionName: str,
+        initialPositionInStream: str,
+        checkpointInterval: int,
+        storageLevel: StorageLevel = ...,
+        awsAccessKeyId: Optional[str] = ...,
+        awsSecretKey: Optional[str] = ...,
+        *,
+        stsAssumeRoleArn: Optional[str] = ...,
+        stsSessionName: Optional[str] = ...,
+        stsExternalId: Optional[str] = ...,
+    ) -> "DStream[Optional[str]]":
+        ...
 
     @staticmethod
-    def createStream(ssc, kinesisAppName, streamName, endpointUrl, regionName,
-                     initialPositionInStream, checkpointInterval,
-                     storageLevel=StorageLevel.MEMORY_AND_DISK_2,
-                     awsAccessKeyId=None, awsSecretKey=None, decoder=utf8_decoder):
+    @overload
+    def createStream(
+        ssc: StreamingContext,
+        kinesisAppName: str,
+        streamName: str,
+        endpointUrl: str,
+        regionName: str,
+        initialPositionInStream: str,
+        checkpointInterval: int,
+        storageLevel: StorageLevel = ...,
+        awsAccessKeyId: Optional[str] = ...,
+        awsSecretKey: Optional[str] = ...,
+        decoder: Callable[[Optional[bytes]], T] = ...,
+        stsAssumeRoleArn: Optional[str] = ...,
+        stsSessionName: Optional[str] = ...,
+        stsExternalId: Optional[str] = ...,
+    ) -> "DStream[T]":
+        ...
+
+    @staticmethod
+    def createStream(
+        ssc: StreamingContext,
+        kinesisAppName: str,
+        streamName: str,
+        endpointUrl: str,
+        regionName: str,
+        initialPositionInStream: str,
+        checkpointInterval: int,
+        storageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK_2,
+        awsAccessKeyId: Optional[str] = None,
+        awsSecretKey: Optional[str] = None,
+        decoder: Union[
+            Callable[[Optional[bytes]], T], Callable[[Optional[bytes]], Optional[str]]
+        ] = utf8_decoder,
+        stsAssumeRoleArn: Optional[str] = None,
+        stsSessionName: Optional[str] = None,
+        stsExternalId: Optional[str] = None,
+    ) -> Union["DStream[Union[T, Optional[str]]]", "DStream[T]"]:
         """
         Create an input stream that pulls messages from a Kinesis stream. This uses the
         Kinesis Client Library (KCL) to pull messages from Kinesis.
 
-        Note: The given AWS credentials will get saved in DStream checkpoints if checkpointing is
-        enabled. Make sure that your checkpoint directory is secure.
+        Parameters
+        ----------
+        ssc : :class:`StreamingContext`
+            StreamingContext object
+        kinesisAppName : str
+            Kinesis application name used by the Kinesis Client Library (KCL) to
+            update DynamoDB
+        streamName : str
+            Kinesis stream name
+        endpointUrl : str
+            Url of Kinesis service (e.g., https://kinesis.us-east-1.amazonaws.com)
+        regionName : str
+            Name of region used by the Kinesis Client Library (KCL) to update
+            DynamoDB (lease coordination and checkpointing) and CloudWatch (metrics)
+        initialPositionInStream : int
+            In the absence of Kinesis checkpoint info, this is the
+            worker's initial starting position in the stream. The
+            values are either the beginning of the stream per Kinesis'
+            limit of 24 hours (InitialPositionInStream.TRIM_HORIZON) or
+            the tip of the stream (InitialPositionInStream.LATEST).
+        checkpointInterval : int
+            Checkpoint interval(in seconds) for Kinesis checkpointing. See the Kinesis
+            Spark Streaming documentation for more details on the different
+            types of checkpoints.
+        storageLevel : :class:`pyspark.StorageLevel`, optional
+            Storage level to use for storing the received objects (default is
+            StorageLevel.MEMORY_AND_DISK_2)
+        awsAccessKeyId : str, optional
+            AWS AccessKeyId (default is None. If None, will use
+            DefaultAWSCredentialsProviderChain)
+        awsSecretKey : str, optional
+            AWS SecretKey (default is None. If None, will use
+            DefaultAWSCredentialsProviderChain)
+        decoder : function, optional
+            A function used to decode value (default is utf8_decoder)
+        stsAssumeRoleArn : str, optional
+            ARN of IAM role to assume when using STS sessions to read from
+            the Kinesis stream (default is None).
+        stsSessionName : str, optional
+            Name to uniquely identify STS sessions used to read from Kinesis
+            stream, if STS is being used (default is None).
+        stsExternalId : str, optional
+            External ID that can be used to validate against the assumed IAM
+            role's trust policy, if STS is being used (default is None).
 
-        :param ssc:  StreamingContext object
-        :param kinesisAppName:  Kinesis application name used by the Kinesis Client Library (KCL) to
-                                update DynamoDB
-        :param streamName:  Kinesis stream name
-        :param endpointUrl:  Url of Kinesis service (e.g., https://kinesis.us-east-1.amazonaws.com)
-        :param regionName:  Name of region used by the Kinesis Client Library (KCL) to update
-                            DynamoDB (lease coordination and checkpointing) and CloudWatch (metrics)
-        :param initialPositionInStream:  In the absence of Kinesis checkpoint info, this is the
-                                         worker's initial starting position in the stream. The
-                                         values are either the beginning of the stream per Kinesis'
-                                         limit of 24 hours (InitialPositionInStream.TRIM_HORIZON) or
-                                         the tip of the stream (InitialPositionInStream.LATEST).
-        :param checkpointInterval:  Checkpoint interval for Kinesis checkpointing. See the Kinesis
-                                    Spark Streaming documentation for more details on the different
-                                    types of checkpoints.
-        :param storageLevel:  Storage level to use for storing the received objects (default is
-                              StorageLevel.MEMORY_AND_DISK_2)
-        :param awsAccessKeyId:  AWS AccessKeyId (default is None. If None, will use
-                                DefaultAWSCredentialsProviderChain)
-        :param awsSecretKey:  AWS SecretKey (default is None. If None, will use
-                              DefaultAWSCredentialsProviderChain)
-        :param decoder:  A function used to decode value (default is utf8_decoder)
-        :return: A DStream object
+        Returns
+        -------
+        A DStream object
+
+        Notes
+        -----
+        The given AWS credentials will get saved in DStream checkpoints if checkpointing
+        is enabled. Make sure that your checkpoint directory is secure.
         """
-        jlevel = ssc._sc._getJavaStorageLevel(storageLevel)
-        jduration = ssc._jduration(checkpointInterval)
+        jlevel = ssc._sc._getJavaStorageLevel(storageLevel)  # type: ignore[attr-defined]
+        jduration = ssc._jduration(checkpointInterval)  # type: ignore[attr-defined]
+
+        jvm = ssc._jvm  # type: ignore[attr-defined]
 
         try:
-            # Use KinesisUtilsPythonHelper to access Scala's KinesisUtils
-            helperClass = ssc._jvm.java.lang.Thread.currentThread().getContextClassLoader()\
-                .loadClass("org.apache.spark.streaming.kinesis.KinesisUtilsPythonHelper")
-            helper = helperClass.newInstance()
-            jstream = helper.createStream(ssc._jssc, kinesisAppName, streamName, endpointUrl,
-                                          regionName, initialPositionInStream, jduration, jlevel,
-                                          awsAccessKeyId, awsSecretKey)
-        except Py4JJavaError as e:
-            if 'ClassNotFoundException' in str(e.java_exception):
-                KinesisUtils._printErrorMsg(ssc.sparkContext)
-            raise e
-        stream = DStream(jstream, ssc, NoOpSerializer())
+            helper = jvm.org.apache.spark.streaming.kinesis.KinesisUtilsPythonHelper()
+        except TypeError as e:
+            if str(e) == "'JavaPackage' object is not callable":
+                _print_missing_jar(
+                    "Streaming's Kinesis",
+                    "streaming-kinesis-asl",
+                    "streaming-kinesis-asl-assembly",
+                    ssc.sparkContext.version,
+                )
+            raise
+        jstream = helper.createStream(
+            ssc._jssc,  # type: ignore[attr-defined]
+            kinesisAppName,
+            streamName,
+            endpointUrl,
+            regionName,
+            initialPositionInStream,
+            jduration,
+            jlevel,
+            awsAccessKeyId,
+            awsSecretKey,
+            stsAssumeRoleArn,
+            stsSessionName,
+            stsExternalId,
+        )
+        stream: DStream = DStream(jstream, ssc, NoOpSerializer())
         return stream.map(lambda v: decoder(v))
 
-    @staticmethod
-    def _printErrorMsg(sc):
-        print("""
-________________________________________________________________________________________________
 
-  Spark Streaming's Kinesis libraries not found in class path. Try one of the following.
-
-  1. Include the Kinesis library and its dependencies with in the
-     spark-submit command as
-
-     $ bin/spark-submit --packages org.apache.spark:spark-streaming-kinesis-asl:%s ...
-
-  2. Download the JAR of the artifact from Maven Central http://search.maven.org/,
-     Group Id = org.apache.spark, Artifact Id = spark-streaming-kinesis-asl-assembly, Version = %s.
-     Then, include the jar in the spark-submit command as
-
-     $ bin/spark-submit --jars <spark-streaming-kinesis-asl-assembly.jar> ...
-
-________________________________________________________________________________________________
-
-""" % (sc.version, sc.version))
-
-
-class InitialPositionInStream(object):
+class InitialPositionInStream:
     LATEST, TRIM_HORIZON = (0, 1)

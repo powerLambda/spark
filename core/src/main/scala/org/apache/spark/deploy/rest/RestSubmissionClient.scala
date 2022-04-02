@@ -19,19 +19,22 @@ package org.apache.spark.deploy.rest
 
 import java.io.{DataOutputStream, FileNotFoundException}
 import java.net.{ConnectException, HttpURLConnection, SocketException, URL}
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeoutException
 import javax.servlet.http.HttpServletResponse
 
 import scala.collection.mutable
-import scala.concurrent.duration._
 import scala.concurrent.{Await, Future}
+import scala.concurrent.duration._
 import scala.io.Source
+import scala.util.control.NonFatal
 
 import com.fasterxml.jackson.core.JsonProcessingException
-import com.google.common.base.Charsets
 
+import org.apache.spark.{SPARK_VERSION => sparkVersion, SparkConf, SparkException}
+import org.apache.spark.deploy.SparkApplication
+import org.apache.spark.internal.Logging
 import org.apache.spark.util.Utils
-import org.apache.spark.{Logging, SPARK_VERSION => sparkVersion, SparkConf}
 
 /**
  * A client that submits applications to a [[RestSubmissionServer]].
@@ -57,8 +60,6 @@ import org.apache.spark.{Logging, SPARK_VERSION => sparkVersion, SparkConf}
  */
 private[spark] class RestSubmissionClient(master: String) extends Logging {
   import RestSubmissionClient._
-
-  private val supportedMasterPrefixes = Seq("spark://", "mesos://")
 
   private val masters: Array[String] = if (master.startsWith("spark://")) {
     Utils.parseStandaloneMasterUrls(master)
@@ -211,7 +212,7 @@ private[spark] class RestSubmissionClient(master: String) extends Logging {
     try {
       val out = new DataOutputStream(conn.getOutputStream)
       Utils.tryWithSafeFinally {
-        out.write(json.getBytes(Charsets.UTF_8))
+        out.write(json.getBytes(StandardCharsets.UTF_8))
       } {
         out.close()
       }
@@ -228,42 +229,62 @@ private[spark] class RestSubmissionClient(master: String) extends Logging {
    * Exposed for testing.
    */
   private[rest] def readResponse(connection: HttpURLConnection): SubmitRestProtocolResponse = {
+    // scalastyle:off executioncontextglobal
     import scala.concurrent.ExecutionContext.Implicits.global
+    // scalastyle:on executioncontextglobal
     val responseFuture = Future {
-      val dataStream =
-        if (connection.getResponseCode == HttpServletResponse.SC_OK) {
-          connection.getInputStream
-        } else {
-          connection.getErrorStream
+      val responseCode = connection.getResponseCode
+
+      if (responseCode != HttpServletResponse.SC_OK) {
+        val errString = Some(Source.fromInputStream(connection.getErrorStream())
+          .getLines().mkString("\n"))
+        if (responseCode == HttpServletResponse.SC_INTERNAL_SERVER_ERROR &&
+          !connection.getContentType().contains("application/json")) {
+          throw new SubmitRestProtocolException(s"Server responded with exception:\n${errString}")
         }
-      // If the server threw an exception while writing a response, it will not have a body
-      if (dataStream == null) {
-        throw new SubmitRestProtocolException("Server returned empty body")
-      }
-      val responseJson = Source.fromInputStream(dataStream).mkString
-      logDebug(s"Response from the server:\n$responseJson")
-      val response = SubmitRestProtocolMessage.fromJson(responseJson)
-      response.validate()
-      response match {
-        // If the response is an error, log the message
-        case error: ErrorResponse =>
-          logError(s"Server responded with error:\n${error.message}")
-          error
-        // Otherwise, simply return the response
-        case response: SubmitRestProtocolResponse => response
-        case unexpected =>
-          throw new SubmitRestProtocolException(
-            s"Message received from server was not a response:\n${unexpected.toJson}")
+        logError(s"Server responded with error:\n${errString}")
+        val error = new ErrorResponse
+        if (responseCode == RestSubmissionServer.SC_UNKNOWN_PROTOCOL_VERSION) {
+          error.highestProtocolVersion = RestSubmissionServer.PROTOCOL_VERSION
+        }
+        error.message = errString.get
+        error
+      } else {
+        val dataStream = connection.getInputStream
+
+        // If the server threw an exception while writing a response, it will not have a body
+        if (dataStream == null) {
+          throw new SubmitRestProtocolException("Server returned empty body")
+        }
+        val responseJson = Source.fromInputStream(dataStream).mkString
+        logDebug(s"Response from the server:\n$responseJson")
+        val response = SubmitRestProtocolMessage.fromJson(responseJson)
+        response.validate()
+        response match {
+          // If the response is an error, log the message
+          case error: ErrorResponse =>
+            logError(s"Server responded with error:\n${error.message}")
+            error
+          // Otherwise, simply return the response
+          case response: SubmitRestProtocolResponse => response
+          case unexpected =>
+            throw new SubmitRestProtocolException(
+              s"Message received from server was not a response:\n${unexpected.toJson}")
+        }
       }
     }
 
+    // scalastyle:off awaitresult
     try { Await.result(responseFuture, 10.seconds) } catch {
+      // scalastyle:on awaitresult
       case unreachable @ (_: FileNotFoundException | _: SocketException) =>
         throw new SubmitRestConnectionException("Unable to connect to server", unreachable)
       case malformed @ (_: JsonProcessingException | _: SubmitRestProtocolException) =>
         throw new SubmitRestProtocolException("Malformed response received from server", malformed)
       case timeout: TimeoutException =>
         throw new SubmitRestConnectionException("No response from server", timeout)
+      case NonFatal(t) =>
+        throw new SparkException("Exception while waiting for response", t)
     }
   }
 
@@ -382,19 +403,38 @@ private[spark] class RestSubmissionClient(master: String) extends Logging {
       logWarning(s"Unable to connect to server ${masterUrl}.")
       lostMasters += masterUrl
     }
-    lostMasters.size >= masters.size
+    lostMasters.size >= masters.length
   }
 }
 
 private[spark] object RestSubmissionClient {
+
+  val supportedMasterPrefixes = Seq("spark://", "mesos://")
+
+  // SPARK_HOME and SPARK_CONF_DIR are filtered out because they are usually wrong
+  // on the remote machine (SPARK-12345) (SPARK-25934)
+  private val EXCLUDED_SPARK_ENV_VARS = Set("SPARK_ENV_LOADED", "SPARK_HOME", "SPARK_CONF_DIR")
   private val REPORT_DRIVER_STATUS_INTERVAL = 1000
   private val REPORT_DRIVER_STATUS_MAX_TRIES = 10
   val PROTOCOL_VERSION = "v1"
 
   /**
-   * Submit an application, assuming Spark parameters are specified through the given config.
-   * This is abstracted to its own method for testing purposes.
+   * Filter non-spark environment variables from any environment.
    */
+  private[rest] def filterSystemEnvironment(env: Map[String, String]): Map[String, String] = {
+    env.filterKeys { k =>
+      (k.startsWith("SPARK_") && !EXCLUDED_SPARK_ENV_VARS.contains(k)) || k.startsWith("MESOS_")
+    }.toMap
+  }
+
+  private[spark] def supportsRestClient(master: String): Boolean = {
+    supportedMasterPrefixes.exists(master.startsWith)
+  }
+}
+
+private[spark] class RestSubmissionClientApp extends SparkApplication {
+
+  /** Submits a request to run the application and return the response. Visible for testing. */
   def run(
       appResource: String,
       mainClass: String,
@@ -411,27 +451,15 @@ private[spark] object RestSubmissionClient {
     client.createSubmission(submitRequest)
   }
 
-  def main(args: Array[String]): Unit = {
-    if (args.size < 2) {
+  override def start(args: Array[String], conf: SparkConf): Unit = {
+    if (args.length < 2) {
       sys.error("Usage: RestSubmissionClient [app resource] [main class] [app args*]")
       sys.exit(1)
     }
     val appResource = args(0)
     val mainClass = args(1)
-    val appArgs = args.slice(2, args.size)
-    val conf = new SparkConf
-    val env = filterSystemEnvironment(sys.env)
+    val appArgs = args.slice(2, args.length)
+    val env = RestSubmissionClient.filterSystemEnvironment(sys.env)
     run(appResource, mainClass, appArgs, conf, env)
-  }
-
-  /**
-   * Filter non-spark environment variables from any environment.
-   */
-  private[rest] def filterSystemEnvironment(env: Map[String, String]): Map[String, String] = {
-    env.filterKeys { k =>
-      // SPARK_HOME is filtered out because it is usually wrong on the remote machine (SPARK-12345)
-      (k.startsWith("SPARK_") && k != "SPARK_ENV_LOADED" && k != "SPARK_HOME") ||
-        k.startsWith("MESOS_")
-    }
   }
 }

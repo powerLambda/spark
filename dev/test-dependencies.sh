@@ -17,28 +17,59 @@
 # limitations under the License.
 #
 
-set -e
+set -ex
 
 FWDIR="$(cd "`dirname $0`"/..; pwd)"
 cd "$FWDIR"
 
+# Explicitly set locale in order to make `sort` output consistent across machines.
+# See https://stackoverflow.com/questions/28881 for more details.
+export LC_ALL=C
+
 # TODO: This would be much nicer to do in SBT, once SBT supports Maven-style resolution.
 
-# NOTE: These should match those in the release publishing script
-HADOOP2_MODULE_PROFILES="-Phive-thriftserver -Pyarn -Phive"
-MVN="build/mvn --force"
-HADOOP_PROFILES=(
-    hadoop-2.3
-    hadoop-2.4
+# NOTE: These should match those in the release publishing script, and be kept in sync with
+#   dev/create-release/release-build.sh
+HADOOP_MODULE_PROFILES="-Phive-thriftserver -Pmesos -Pkubernetes -Pyarn -Phive \
+    -Pspark-ganglia-lgpl -Pkinesis-asl -Phadoop-cloud"
+MVN="build/mvn"
+HADOOP_HIVE_PROFILES=(
+    hadoop-2-hive-2.3
+    hadoop-3-hive-2.3
 )
 
 # We'll switch the version to a temp. one, publish POMs using that new version, then switch back to
 # the old version. We need to do this because the `dependency:build-classpath` task needs to
 # resolve Spark's internal submodule dependencies.
 
-# See http://stackoverflow.com/a/3545363 for an explanation of this one-liner:
-OLD_VERSION=$(mvn help:evaluate -Dexpression=project.version|grep -Ev '(^\[|Download\w+:)')
-TEMP_VERSION="spark-$(date +%s | tail -c6)"
+# From http://stackoverflow.com/a/26514030
+set +e
+OLD_VERSION=$($MVN -q \
+    -Dexec.executable="echo" \
+    -Dexec.args='${project.version}' \
+    --non-recursive \
+    org.codehaus.mojo:exec-maven-plugin:1.6.0:exec | grep -E '[0-9]+\.[0-9]+\.[0-9]+')
+# dependency:get for guava and jetty-io are workaround for SPARK-37302.
+GUAVA_VERSION=$(build/mvn help:evaluate -Dexpression=guava.version -q -DforceStdout | grep -E "^[0-9.]+$")
+build/mvn dependency:get -Dartifact=com.google.guava:guava:${GUAVA_VERSION} -q
+JETTY_VERSION=$(build/mvn help:evaluate -Dexpression=jetty.version -q -DforceStdout | grep -E "^[0-9.]+v[0-9]+")
+build/mvn dependency:get -Dartifact=org.eclipse.jetty:jetty-io:${JETTY_VERSION} -q
+if [ $? != 0 ]; then
+    echo -e "Error while getting version string from Maven:\n$OLD_VERSION"
+    exit 1
+fi
+SCALA_BINARY_VERSION=$($MVN -q \
+    -Dexec.executable="echo" \
+    -Dexec.args='${scala.binary.version}' \
+    --non-recursive \
+    org.codehaus.mojo:exec-maven-plugin:1.6.0:exec | grep -E '[0-9]+\.[0-9]+')
+if [[ "$SCALA_BINARY_VERSION" != "2.12" ]]; then
+  # TODO(SPARK-36168) Support Scala 2.13 in dev/test-dependencies.sh
+  echo "Skip dependency testing on $SCALA_BINARY_VERSION"
+  exit 0
+fi
+set -e
+TEMP_VERSION="spark-$(python3 -S -c "import random; print(random.randrange(100000, 999999))")"
 
 function reset_version {
   # Delete the temporary POMs that we wrote to the local Maven repo:
@@ -52,28 +83,40 @@ trap reset_version EXIT
 $MVN -q versions:set -DnewVersion=$TEMP_VERSION -DgenerateBackupPoms=false > /dev/null
 
 # Generate manifests for each Hadoop profile:
-for HADOOP_PROFILE in "${HADOOP_PROFILES[@]}"; do
-  echo "Performing Maven install for $HADOOP_PROFILE"
-  $MVN $HADOOP2_MODULE_PROFILES -P$HADOOP_PROFILE jar:jar install:install -q \
-    -pl '!assembly' \
-    -pl '!examples' \
-    -pl '!external/flume-assembly' \
-    -pl '!external/kafka-assembly' \
-    -pl '!external/twitter' \
-    -pl '!external/flume' \
-    -pl '!external/mqtt' \
-    -pl '!external/mqtt-assembly' \
-    -pl '!external/zeromq' \
-    -pl '!external/kafka' \
-    -pl '!tags' \
-    -DskipTests
+for HADOOP_HIVE_PROFILE in "${HADOOP_HIVE_PROFILES[@]}"; do
+  if [[ $HADOOP_HIVE_PROFILE == **hadoop-3-hive-2.3** ]]; then
+    HADOOP_PROFILE=hadoop-3
+  else
+    HADOOP_PROFILE=hadoop-2
+  fi
+  echo "Performing Maven install for $HADOOP_HIVE_PROFILE"
+  $MVN $HADOOP_MODULE_PROFILES -P$HADOOP_PROFILE jar:jar jar:test-jar install:install clean -q
 
-  echo "Generating dependency manifest for $HADOOP_PROFILE"
+  echo "Performing Maven validate for $HADOOP_HIVE_PROFILE"
+  $MVN $HADOOP_MODULE_PROFILES -P$HADOOP_PROFILE validate -q
+
+  echo "Generating dependency manifest for $HADOOP_HIVE_PROFILE"
   mkdir -p dev/pr-deps
-  $MVN $HADOOP2_MODULE_PROFILES -P$HADOOP_PROFILE dependency:build-classpath -pl assembly \
-    | grep "Building Spark Project Assembly" -A 5 \
-    | tail -n 1 | tr ":" "\n" | rev | cut -d "/" -f 1 | rev | sort \
-    | grep -v spark > dev/pr-deps/spark-deps-$HADOOP_PROFILE
+  $MVN $HADOOP_MODULE_PROFILES -P$HADOOP_PROFILE dependency:build-classpath -pl assembly -am \
+    | grep "Dependencies classpath:" -A 1 \
+    | tail -n 1 | tr ":" "\n" | awk -F '/' '{
+      # For each dependency classpath, we fetch the last three parts split by "/": artifact id, version, and jar name.
+      # Since classifier, if exists, always sits between "artifact_id-version-" and ".jar" suffix in the jar name,
+      # we extract classifier and put it right before the jar name explicitly.
+      # For example, `orc-core/1.5.5/nohive/orc-core-1.5.5-nohive.jar`
+      #                              ^^^^^^
+      #                              extracted classifier
+      #               `okio/1.15.0//okio-1.15.0.jar`
+      #                           ^
+      #                           empty for dependencies without classifier
+      artifact_id=$(NF-2);
+      version=$(NF-1);
+      jar_name=$NF;
+      classifier_start_index=length(artifact_id"-"version"-") + 1;
+      classifier_end_index=index(jar_name, ".jar") - 1;
+      classifier=substr(jar_name, classifier_start_index, classifier_end_index - classifier_start_index + 1);
+      print artifact_id"/"version"/"classifier"/"jar_name
+    }' | sort | grep -v spark > dev/pr-deps/spark-deps-$HADOOP_HIVE_PROFILE
 done
 
 if [[ $@ == **replace-manifest** ]]; then
@@ -83,13 +126,13 @@ if [[ $@ == **replace-manifest** ]]; then
   exit 0
 fi
 
-for HADOOP_PROFILE in "${HADOOP_PROFILES[@]}"; do
+for HADOOP_HIVE_PROFILE in "${HADOOP_HIVE_PROFILES[@]}"; do
   set +e
   dep_diff="$(
     git diff \
     --no-index \
-    dev/deps/spark-deps-$HADOOP_PROFILE \
-    dev/pr-deps/spark-deps-$HADOOP_PROFILE \
+    dev/deps/spark-deps-$HADOOP_HIVE_PROFILE \
+    dev/pr-deps/spark-deps-$HADOOP_HIVE_PROFILE \
   )"
   set -e
   if [ "$dep_diff" != "" ]; then
@@ -100,3 +143,5 @@ for HADOOP_PROFILE in "${HADOOP_PROFILES[@]}"; do
     exit 1
   fi
 done
+
+exit 0

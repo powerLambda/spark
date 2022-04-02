@@ -31,28 +31,14 @@ if [[ "$@" = *--help ]] || [[ "$@" = *-h ]]; then
   echo "Usage: ./sbin/start-master.sh [options]"
   pattern="Usage:"
   pattern+="\|Using Spark's default log4j profile:"
-  pattern+="\|Registered signal handlers for"
+  pattern+="\|Started daemon with process name"
+  pattern+="\|Registered signal handler for"
 
   "${SPARK_HOME}"/bin/spark-class $CLASS --help 2>&1 | grep -v "$pattern" 1>&2
   exit 1
 fi
 
 ORIGINAL_ARGS="$@"
-
-START_TACHYON=false
-
-while (( "$#" )); do
-case $1 in
-    --with-tachyon)
-      if [ ! -e "${SPARK_HOME}"/tachyon/bin/tachyon ]; then
-        echo "Error: --with-tachyon specified, but tachyon not found."
-        exit -1
-      fi
-      START_TACHYON=true
-      ;;
-  esac
-shift
-done
 
 . "${SPARK_HOME}/sbin/spark-config.sh"
 
@@ -62,8 +48,15 @@ if [ "$SPARK_MASTER_PORT" = "" ]; then
   SPARK_MASTER_PORT=7077
 fi
 
-if [ "$SPARK_MASTER_IP" = "" ]; then
-  SPARK_MASTER_IP=`hostname`
+if [ "$SPARK_MASTER_HOST" = "" ]; then
+  case `uname` in
+      (SunOS)
+          SPARK_MASTER_HOST="`/usr/sbin/check-hostname | awk '{print $NF}'`"
+          ;;
+      (*)
+          SPARK_MASTER_HOST="`hostname -f`"
+          ;;
+  esac
 fi
 
 if [ "$SPARK_MASTER_WEBUI_PORT" = "" ]; then
@@ -71,11 +64,5 @@ if [ "$SPARK_MASTER_WEBUI_PORT" = "" ]; then
 fi
 
 "${SPARK_HOME}/sbin"/spark-daemon.sh start $CLASS 1 \
-  --ip $SPARK_MASTER_IP --port $SPARK_MASTER_PORT --webui-port $SPARK_MASTER_WEBUI_PORT \
+  --host $SPARK_MASTER_HOST --port $SPARK_MASTER_PORT --webui-port $SPARK_MASTER_WEBUI_PORT \
   $ORIGINAL_ARGS
-
-if [ "$START_TACHYON" == "true" ]; then
-  "${SPARK_HOME}"/tachyon/bin/tachyon bootstrap-conf $SPARK_MASTER_IP
-  "${SPARK_HOME}"/tachyon/bin/tachyon format -s
-  "${SPARK_HOME}"/tachyon/bin/tachyon-start.sh master
-fi

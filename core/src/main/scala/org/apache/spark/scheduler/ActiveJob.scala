@@ -19,7 +19,6 @@ package org.apache.spark.scheduler
 
 import java.util.Properties
 
-import org.apache.spark.TaskContext
 import org.apache.spark.util.CallSite
 
 /**
@@ -54,11 +53,17 @@ private[spark] class ActiveJob(
    */
   val numPartitions = finalStage match {
     case r: ResultStage => r.partitions.length
-    case m: ShuffleMapStage => m.rdd.partitions.length
+    case m: ShuffleMapStage => m.numPartitions
   }
 
   /** Which partitions of the stage have finished */
   val finished = Array.fill[Boolean](numPartitions)(false)
 
   var numFinished = 0
+
+  /** Resets the status of all partitions in this stage so they are marked as not finished. */
+  def resetAllPartitions(): Unit = {
+    (0 until numPartitions).foreach(finished.update(_, false))
+    numFinished = 0
+  }
 }

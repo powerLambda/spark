@@ -18,15 +18,14 @@
 // scalastyle:off println
 package org.apache.spark.examples.mllib
 
+import org.apache.spark.{SparkConf, SparkContext}
 // $example on$
 import org.apache.spark.mllib.fpm.PrefixSpan
 // $example off$
 
-import org.apache.spark.{SparkConf, SparkContext}
-
 object PrefixSpanExample {
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     val conf = new SparkConf().setAppName("PrefixSpanExample")
     val sc = new SparkContext(conf)
 
@@ -43,10 +42,12 @@ object PrefixSpanExample {
     val model = prefixSpan.run(sequences)
     model.freqSequences.collect().foreach { freqSequence =>
       println(
-        freqSequence.sequence.map(_.mkString("[", ", ", "]")).mkString("[", ", ", "]") +
-          ", " + freqSequence.freq)
+        s"${freqSequence.sequence.map(_.mkString("[", ", ", "]")).mkString("[", ", ", "]")}," +
+          s" ${freqSequence.freq}")
     }
     // $example off$
+
+    sc.stop()
   }
 }
 // scalastyle:off println

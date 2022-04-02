@@ -17,10 +17,10 @@
 
 package org.apache.spark.shuffle.sort
 
-import org.mockito.Mockito._
+import org.mockito.Mockito.{mock, when}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
-import org.scalatest.Matchers
+import org.scalatest.matchers.must.Matchers
 
 import org.apache.spark._
 import org.apache.spark.serializer.{JavaSerializer, KryoSerializer, Serializer}
@@ -30,6 +30,8 @@ import org.apache.spark.serializer.{JavaSerializer, KryoSerializer, Serializer}
  * performed in other suites.
  */
 class SortShuffleManagerSuite extends SparkFunSuite with Matchers {
+
+  private def doReturn(value: Any) = org.mockito.Mockito.doReturn(value, Seq.empty: _*)
 
   import SortShuffleManager.canUseSerializedShuffle
 
@@ -41,7 +43,7 @@ class SortShuffleManagerSuite extends SparkFunSuite with Matchers {
 
   private def shuffleDep(
       partitioner: Partitioner,
-      serializer: Option[Serializer],
+      serializer: Serializer,
       keyOrdering: Option[Ordering[Any]],
       aggregator: Option[Aggregator[Any, Any, Any]],
       mapSideCombine: Boolean): ShuffleDependency[Any, Any, Any] = {
@@ -56,7 +58,7 @@ class SortShuffleManagerSuite extends SparkFunSuite with Matchers {
   }
 
   test("supported shuffle dependencies for serialized shuffle") {
-    val kryo = Some(new KryoSerializer(new SparkConf()))
+    val kryo = new KryoSerializer(new SparkConf())
 
     assert(canUseSerializedShuffle(shuffleDep(
       partitioner = new HashPartitioner(2),
@@ -85,11 +87,19 @@ class SortShuffleManagerSuite extends SparkFunSuite with Matchers {
       mapSideCombine = false
     )))
 
+    // We support serialized shuffle if we do not need to do map-side aggregation
+    assert(canUseSerializedShuffle(shuffleDep(
+      partitioner = new HashPartitioner(2),
+      serializer = kryo,
+      keyOrdering = None,
+      aggregator = Some(mock(classOf[Aggregator[Any, Any, Any]])),
+      mapSideCombine = false
+    )))
   }
 
   test("unsupported shuffle dependencies for serialized shuffle") {
-    val kryo = Some(new KryoSerializer(new SparkConf()))
-    val java = Some(new JavaSerializer(new SparkConf()))
+    val kryo = new KryoSerializer(new SparkConf())
+    val java = new JavaSerializer(new SparkConf())
 
     // We only support serializers that support object relocation
     assert(!canUseSerializedShuffle(shuffleDep(
@@ -111,14 +121,7 @@ class SortShuffleManagerSuite extends SparkFunSuite with Matchers {
       mapSideCombine = false
     )))
 
-    // We do not support shuffles that perform aggregation
-    assert(!canUseSerializedShuffle(shuffleDep(
-      partitioner = new HashPartitioner(2),
-      serializer = kryo,
-      keyOrdering = None,
-      aggregator = Some(mock(classOf[Aggregator[Any, Any, Any]])),
-      mapSideCombine = false
-    )))
+    // We do not support serialized shuffle if we need to do map-side aggregation
     assert(!canUseSerializedShuffle(shuffleDep(
       partitioner = new HashPartitioner(2),
       serializer = kryo,

@@ -18,10 +18,10 @@
 // scalastyle:off println
 package org.apache.spark.examples.mllib
 
+import org.apache.spark.SparkConf
+import org.apache.spark.mllib.classification.StreamingLogisticRegressionWithSGD
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.classification.StreamingLogisticRegressionWithSGD
-import org.apache.spark.SparkConf
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 
 /**
@@ -46,7 +46,7 @@ import org.apache.spark.streaming.{Seconds, StreamingContext}
  */
 object StreamingLogisticRegression {
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
 
     if (args.length != 4) {
       System.err.println(

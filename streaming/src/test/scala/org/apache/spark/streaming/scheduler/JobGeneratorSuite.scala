@@ -20,7 +20,6 @@ package org.apache.spark.streaming.scheduler
 import java.util.concurrent.CountDownLatch
 
 import scala.concurrent.duration._
-import scala.language.postfixOps
 
 import org.scalatest.concurrent.Eventually._
 
@@ -56,8 +55,7 @@ class JobGeneratorSuite extends TestSuiteBase {
   // 4. allow subsequent batches to be generated (to allow premature deletion of 3rd batch metadata)
   // 5. verify whether 3rd batch's block metadata still exists
   //
-  // TODO: SPARK-7420 enable this test
-  ignore("SPARK-6222: Do not clear received block data too soon") {
+  test("SPARK-6222: Do not clear received block data too soon") {
     import JobGeneratorSuite._
     val checkpointDir = Utils.createTempDir()
     val testConf = conf
@@ -70,10 +68,10 @@ class JobGeneratorSuite extends TestSuiteBase {
       val longBatchNumber = 3 // 3rd batch will take a long time
       val longBatchTime = longBatchNumber * batchDuration.milliseconds
 
-      val testTimeout = timeout(10 seconds)
+      val testTimeout = timeout(10.seconds)
       val inputStream = ssc.receiverStream(new TestReceiver)
 
-      inputStream.foreachRDD((rdd: RDD[Int], time: Time) => {
+      inputStream.foreachRDD((_: RDD[Int], time: Time) => {
         if (time.milliseconds == longBatchTime) {
           while (waitLatch.getCount() > 0) {
             waitLatch.await()
@@ -95,14 +93,14 @@ class JobGeneratorSuite extends TestSuiteBase {
       }
 
       // Wait for new blocks to be received
-      def waitForNewReceivedBlocks() {
+      def waitForNewReceivedBlocks(): Unit = {
         eventually(testTimeout) {
           assert(receiverTracker.hasUnallocatedBlocks)
         }
       }
 
       // Wait for received blocks to be allocated to a batch
-      def waitForBlocksToBeAllocatedToBatch(batchTime: Long) {
+      def waitForBlocksToBeAllocatedToBatch(batchTime: Long): Unit = {
         eventually(testTimeout) {
           assert(getBlocksOfBatch(batchTime).nonEmpty)
         }
@@ -124,6 +122,7 @@ class JobGeneratorSuite extends TestSuiteBase {
       assert(getBlocksOfBatch(longBatchTime).nonEmpty, "blocks of incomplete batch already deleted")
       assert(batchCounter.getNumCompletedBatches < longBatchNumber)
       waitLatch.countDown()
+      ssc.stop()
     }
   }
 }

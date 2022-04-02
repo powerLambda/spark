@@ -33,9 +33,9 @@ class QueueInputDStream[T: ClassTag](
     defaultRDD: RDD[T]
   ) extends InputDStream[T](ssc) {
 
-  override def start() { }
+  override def start(): Unit = { }
 
-  override def stop() { }
+  override def stop(): Unit = { }
 
   private def readObject(in: ObjectInputStream): Unit = {
     throw new NotSerializableException("queueStream doesn't support checkpointing. " +
@@ -48,12 +48,15 @@ class QueueInputDStream[T: ClassTag](
 
   override def compute(validTime: Time): Option[RDD[T]] = {
     val buffer = new ArrayBuffer[RDD[T]]()
-    if (oneAtATime && queue.size > 0) {
-      buffer += queue.dequeue()
-    } else {
-      buffer ++= queue.dequeueAll(_ => true)
+    queue.synchronized {
+      if (oneAtATime && queue.nonEmpty) {
+        buffer += queue.dequeue()
+      } else {
+        buffer ++= queue
+        queue.clear()
+      }
     }
-    if (buffer.size > 0) {
+    if (buffer.nonEmpty) {
       if (oneAtATime) {
         Some(buffer.head)
       } else {

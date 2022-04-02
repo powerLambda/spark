@@ -19,7 +19,9 @@ package org.apache.spark.sql.catalyst
 
 import java.lang.{Iterable => JavaIterable}
 import java.math.{BigDecimal => JavaBigDecimal}
+import java.math.{BigInteger => JavaBigInteger}
 import java.sql.{Date, Timestamp}
+import java.time.{Duration, Instant, LocalDate, LocalDateTime, Period}
 import java.util.{Map => JavaMap}
 import javax.annotation.Nullable
 
@@ -28,7 +30,10 @@ import scala.language.existentials
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.types.DayTimeIntervalType._
+import org.apache.spark.sql.types.YearMonthIntervalType._
 import org.apache.spark.unsafe.types.UTF8String
 
 /**
@@ -39,7 +44,7 @@ object CatalystTypeConverters {
   // Since the map values can be mutable, we explicitly import scala.collection.Map at here.
   import scala.collection.Map
 
-  private def isPrimitive(dataType: DataType): Boolean = {
+  private[sql] def isPrimitive(dataType: DataType): Boolean = {
     dataType match {
       case BooleanType => true
       case ByteType => true
@@ -59,8 +64,11 @@ object CatalystTypeConverters {
       case mapType: MapType => MapConverter(mapType.keyType, mapType.valueType)
       case structType: StructType => StructConverter(structType)
       case StringType => StringConverter
+      case DateType if SQLConf.get.datetimeJava8ApiEnabled => LocalDateConverter
       case DateType => DateConverter
+      case TimestampType if SQLConf.get.datetimeJava8ApiEnabled => InstantConverter
       case TimestampType => TimestampConverter
+      case TimestampNTZType => TimestampNTZConverter
       case dt: DecimalType => new DecimalConverter(dt)
       case BooleanType => BooleanConverter
       case ByteType => ByteConverter
@@ -69,6 +77,8 @@ object CatalystTypeConverters {
       case LongType => LongConverter
       case FloatType => FloatConverter
       case DoubleType => DoubleConverter
+      case DayTimeIntervalType(_, endField) => DurationConverter(endField)
+      case YearMonthIntervalType(_, endField) => PeriodConverter(endField)
       case dataType: DataType => IdentityConverter(dataType)
     }
     converter.asInstanceOf[CatalystTypeConverter[Any, Any, Any]]
@@ -89,17 +99,10 @@ object CatalystTypeConverters {
      * and Options.
      */
     final def toCatalyst(@Nullable maybeScalaValue: Any): CatalystType = {
-      if (maybeScalaValue == null) {
-        null.asInstanceOf[CatalystType]
-      } else if (maybeScalaValue.isInstanceOf[Option[ScalaInputType]]) {
-        val opt = maybeScalaValue.asInstanceOf[Option[ScalaInputType]]
-        if (opt.isDefined) {
-          toCatalystImpl(opt.get)
-        } else {
-          null.asInstanceOf[CatalystType]
-        }
-      } else {
-        toCatalystImpl(maybeScalaValue.asInstanceOf[ScalaInputType])
+      maybeScalaValue match {
+        case null | None => null.asInstanceOf[CatalystType]
+        case opt: Some[ScalaInputType] => toCatalystImpl(opt.get)
+        case other => toCatalystImpl(other.asInstanceOf[ScalaInputType])
       }
     }
 
@@ -136,16 +139,16 @@ object CatalystTypeConverters {
     override def toScalaImpl(row: InternalRow, column: Int): Any = row.get(column, dataType)
   }
 
-  private case class UDTConverter(
-      udt: UserDefinedType[_]) extends CatalystTypeConverter[Any, Any, Any] {
+  private case class UDTConverter[A >: Null](
+      udt: UserDefinedType[A]) extends CatalystTypeConverter[A, A, Any] {
     // toCatalyst (it calls toCatalystImpl) will do null check.
-    override def toCatalystImpl(scalaValue: Any): Any = udt.serialize(scalaValue)
+    override def toCatalystImpl(scalaValue: A): Any = udt.serialize(scalaValue)
 
-    override def toScala(catalystValue: Any): Any = {
+    override def toScala(catalystValue: Any): A = {
       if (catalystValue == null) null else udt.deserialize(catalystValue)
     }
 
-    override def toScalaImpl(row: InternalRow, column: Int): Any =
+    override def toScalaImpl(row: InternalRow, column: Int): A =
       toScala(row.get(column, udt.sqlType))
   }
 
@@ -159,7 +162,7 @@ object CatalystTypeConverters {
       scalaValue match {
         case a: Array[_] =>
           new GenericArrayData(a.map(elementConverter.toCatalyst))
-        case s: Seq[_] =>
+        case s: scala.collection.Seq[_] =>
           new GenericArrayData(s.map(elementConverter.toCatalyst).toArray)
         case i: JavaIterable[_] =>
           val iter = i.iterator
@@ -169,6 +172,9 @@ object CatalystTypeConverters {
             convertedIterable += elementConverter.toCatalyst(item)
           }
           new GenericArrayData(convertedIterable.toArray)
+        case other => throw new IllegalArgumentException(
+          s"The value (${other.toString}) of the type (${other.getClass.getCanonicalName}) "
+            + s"cannot be converted to an array of ${elementType.catalogString}")
       }
     }
 
@@ -198,34 +204,18 @@ object CatalystTypeConverters {
     private[this] val keyConverter = getConverterForType(keyType)
     private[this] val valueConverter = getConverterForType(valueType)
 
-    override def toCatalystImpl(scalaValue: Any): MapData = scalaValue match {
-      case m: Map[_, _] =>
-        val length = m.size
-        val convertedKeys = new Array[Any](length)
-        val convertedValues = new Array[Any](length)
+    override def toCatalystImpl(scalaValue: Any): MapData = {
+      val keyFunction = (k: Any) => keyConverter.toCatalyst(k)
+      val valueFunction = (k: Any) => valueConverter.toCatalyst(k)
 
-        var i = 0
-        for ((key, value) <- m) {
-          convertedKeys(i) = keyConverter.toCatalyst(key)
-          convertedValues(i) = valueConverter.toCatalyst(value)
-          i += 1
-        }
-        ArrayBasedMapData(convertedKeys, convertedValues)
-
-      case jmap: JavaMap[_, _] =>
-        val length = jmap.size()
-        val convertedKeys = new Array[Any](length)
-        val convertedValues = new Array[Any](length)
-
-        var i = 0
-        val iter = jmap.entrySet.iterator
-        while (iter.hasNext) {
-          val entry = iter.next()
-          convertedKeys(i) = keyConverter.toCatalyst(entry.getKey)
-          convertedValues(i) = valueConverter.toCatalyst(entry.getValue)
-          i += 1
-        }
-        ArrayBasedMapData(convertedKeys, convertedValues)
+      scalaValue match {
+        case map: Map[_, _] => ArrayBasedMapData(map, keyFunction, valueFunction)
+        case javaMap: JavaMap[_, _] => ArrayBasedMapData(javaMap, keyFunction, valueFunction)
+        case other => throw new IllegalArgumentException(
+          s"The value (${other.toString}) of the type (${other.getClass.getCanonicalName}) "
+            + "cannot be converted to a map type with "
+            + s"key type (${keyType.catalogString}) and value type (${valueType.catalogString})")
+      }
     }
 
     override def toScala(catalystValue: MapData): Map[Any, Any] = {
@@ -271,6 +261,9 @@ object CatalystTypeConverters {
           idx += 1
         }
         new GenericInternalRow(ar)
+      case other => throw new IllegalArgumentException(
+        s"The value (${other.toString}) of the type (${other.getClass.getCanonicalName}) "
+          + s"cannot be converted to ${structType.catalogString}")
     }
 
     override def toScala(row: InternalRow): Row = {
@@ -295,6 +288,11 @@ object CatalystTypeConverters {
     override def toCatalystImpl(scalaValue: Any): UTF8String = scalaValue match {
       case str: String => UTF8String.fromString(str)
       case utf8: UTF8String => utf8
+      case chr: Char => UTF8String.fromString(chr.toString)
+      case ac: Array[Char] => UTF8String.fromString(String.valueOf(ac))
+      case other => throw new IllegalArgumentException(
+        s"The value (${other.toString}) of the type (${other.getClass.getCanonicalName}) "
+          + s"cannot be converted to the string type")
     }
     override def toScala(catalystValue: UTF8String): String =
       if (catalystValue == null) null else catalystValue.toString
@@ -302,17 +300,39 @@ object CatalystTypeConverters {
       row.getUTF8String(column).toString
   }
 
-  private object DateConverter extends CatalystTypeConverter[Date, Date, Any] {
-    override def toCatalystImpl(scalaValue: Date): Int = DateTimeUtils.fromJavaDate(scalaValue)
+  private object DateConverter extends CatalystTypeConverter[Any, Date, Any] {
+    override def toCatalystImpl(scalaValue: Any): Int = scalaValue match {
+      case d: Date => DateTimeUtils.fromJavaDate(d)
+      case l: LocalDate => DateTimeUtils.localDateToDays(l)
+      case other => throw new IllegalArgumentException(
+        s"The value (${other.toString}) of the type (${other.getClass.getCanonicalName}) "
+          + s"cannot be converted to the ${DateType.sql} type")
+    }
     override def toScala(catalystValue: Any): Date =
       if (catalystValue == null) null else DateTimeUtils.toJavaDate(catalystValue.asInstanceOf[Int])
     override def toScalaImpl(row: InternalRow, column: Int): Date =
       DateTimeUtils.toJavaDate(row.getInt(column))
   }
 
-  private object TimestampConverter extends CatalystTypeConverter[Timestamp, Timestamp, Any] {
-    override def toCatalystImpl(scalaValue: Timestamp): Long =
-      DateTimeUtils.fromJavaTimestamp(scalaValue)
+  private object LocalDateConverter extends CatalystTypeConverter[Any, LocalDate, Any] {
+    override def toCatalystImpl(scalaValue: Any): Int =
+      DateConverter.toCatalystImpl(scalaValue)
+    override def toScala(catalystValue: Any): LocalDate = {
+      if (catalystValue == null) null
+      else DateTimeUtils.daysToLocalDate(catalystValue.asInstanceOf[Int])
+    }
+    override def toScalaImpl(row: InternalRow, column: Int): LocalDate =
+      DateTimeUtils.daysToLocalDate(row.getInt(column))
+  }
+
+  private object TimestampConverter extends CatalystTypeConverter[Any, Timestamp, Any] {
+    override def toCatalystImpl(scalaValue: Any): Long = scalaValue match {
+      case t: Timestamp => DateTimeUtils.fromJavaTimestamp(t)
+      case i: Instant => DateTimeUtils.instantToMicros(i)
+      case other => throw new IllegalArgumentException(
+        s"The value (${other.toString}) of the type (${other.getClass.getCanonicalName}) "
+          + s"cannot be converted to the ${TimestampType.sql} type")
+    }
     override def toScala(catalystValue: Any): Timestamp =
       if (catalystValue == null) null
       else DateTimeUtils.toJavaTimestamp(catalystValue.asInstanceOf[Long])
@@ -320,19 +340,49 @@ object CatalystTypeConverters {
       DateTimeUtils.toJavaTimestamp(row.getLong(column))
   }
 
+  private object InstantConverter extends CatalystTypeConverter[Any, Instant, Any] {
+    override def toCatalystImpl(scalaValue: Any): Long =
+      TimestampConverter.toCatalystImpl(scalaValue)
+    override def toScala(catalystValue: Any): Instant =
+      if (catalystValue == null) null
+      else DateTimeUtils.microsToInstant(catalystValue.asInstanceOf[Long])
+    override def toScalaImpl(row: InternalRow, column: Int): Instant =
+      DateTimeUtils.microsToInstant(row.getLong(column))
+  }
+
+  private object TimestampNTZConverter
+    extends CatalystTypeConverter[Any, LocalDateTime, Any] {
+    override def toCatalystImpl(scalaValue: Any): Any = scalaValue match {
+      case l: LocalDateTime => DateTimeUtils.localDateTimeToMicros(l)
+      case other => throw new IllegalArgumentException(
+        s"The value (${other.toString}) of the type (${other.getClass.getCanonicalName}) "
+          + s"cannot be converted to the ${TimestampNTZType.sql} type")
+    }
+
+    override def toScala(catalystValue: Any): LocalDateTime =
+      if (catalystValue == null) null
+      else DateTimeUtils.microsToLocalDateTime(catalystValue.asInstanceOf[Long])
+
+    override def toScalaImpl(row: InternalRow, column: Int): LocalDateTime =
+      DateTimeUtils.microsToLocalDateTime(row.getLong(column))
+  }
+
   private class DecimalConverter(dataType: DecimalType)
     extends CatalystTypeConverter[Any, JavaBigDecimal, Decimal] {
+
+    private val nullOnOverflow = !SQLConf.get.ansiEnabled
+
     override def toCatalystImpl(scalaValue: Any): Decimal = {
       val decimal = scalaValue match {
         case d: BigDecimal => Decimal(d)
         case d: JavaBigDecimal => Decimal(d)
+        case d: JavaBigInteger => Decimal(d)
         case d: Decimal => d
+        case other => throw new IllegalArgumentException(
+          s"The value (${other.toString}) of the type (${other.getClass.getCanonicalName}) "
+            + s"cannot be converted to ${dataType.catalogString}")
       }
-      if (decimal.changePrecision(dataType.precision, dataType.scale)) {
-        decimal
-      } else {
-        null
-      }
+      decimal.toPrecision(dataType.precision, dataType.scale, Decimal.ROUND_HALF_UP, nullOnOverflow)
     }
     override def toScala(catalystValue: Decimal): JavaBigDecimal = {
       if (catalystValue == null) null
@@ -375,12 +425,38 @@ object CatalystTypeConverters {
     override def toScalaImpl(row: InternalRow, column: Int): Double = row.getDouble(column)
   }
 
+  private case class DurationConverter(endField: Byte)
+      extends CatalystTypeConverter[Duration, Duration, Any] {
+    override def toCatalystImpl(scalaValue: Duration): Long = {
+      IntervalUtils.durationToMicros(scalaValue, endField)
+    }
+    override def toScala(catalystValue: Any): Duration = {
+      if (catalystValue == null) null
+      else IntervalUtils.microsToDuration(catalystValue.asInstanceOf[Long])
+    }
+    override def toScalaImpl(row: InternalRow, column: Int): Duration =
+      IntervalUtils.microsToDuration(row.getLong(column))
+  }
+
+  private case class PeriodConverter(endField: Byte)
+      extends CatalystTypeConverter[Period, Period, Any] {
+    override def toCatalystImpl(scalaValue: Period): Int = {
+      IntervalUtils.periodToMonths(scalaValue, endField)
+    }
+    override def toScala(catalystValue: Any): Period = {
+      if (catalystValue == null) null
+      else IntervalUtils.monthsToPeriod(catalystValue.asInstanceOf[Int])
+    }
+    override def toScalaImpl(row: InternalRow, column: Int): Period =
+      IntervalUtils.monthsToPeriod(row.getInt(column))
+  }
+
   /**
    * Creates a converter function that will convert Scala objects to the specified Catalyst type.
    * Typical use case would be converting a collection of rows that have the same schema. You will
    * call this function once to get a converter, and apply it to every row.
    */
-  private[sql] def createToCatalystConverter(dataType: DataType): Any => Any = {
+  def createToCatalystConverter(dataType: DataType): Any => Any = {
     if (isPrimitive(dataType)) {
       // Although the `else` branch here is capable of handling inbound conversion of primitives,
       // we add some special-case handling for those types here. The motivation for this relates to
@@ -390,10 +466,9 @@ object CatalystTypeConverters {
       // a measurable performance impact. Note that this optimization will be unnecessary if we
       // use code generation to construct Scala Row -> Catalyst Row converters.
       def convert(maybeScalaValue: Any): Any = {
-        if (maybeScalaValue.isInstanceOf[Option[Any]]) {
-          maybeScalaValue.asInstanceOf[Option[Any]].orNull
-        } else {
-          maybeScalaValue
+        maybeScalaValue match {
+          case opt: Option[Any] => opt.orNull
+          case _ => maybeScalaValue
         }
       }
       convert
@@ -407,7 +482,7 @@ object CatalystTypeConverters {
    * Typical use case would be converting a collection of rows that have the same schema. You will
    * call this function once to get a converter, and apply it to every row.
    */
-  private[sql] def createToScalaConverter(dataType: DataType): Any => Any = {
+  def createToScalaConverter(dataType: DataType): Any => Any = {
     if (isPrimitive(dataType)) {
       identity
     } else {
@@ -425,24 +500,24 @@ object CatalystTypeConverters {
   def convertToCatalyst(a: Any): Any = a match {
     case s: String => StringConverter.toCatalyst(s)
     case d: Date => DateConverter.toCatalyst(d)
+    case ld: LocalDate => LocalDateConverter.toCatalyst(ld)
     case t: Timestamp => TimestampConverter.toCatalyst(t)
+    case i: Instant => InstantConverter.toCatalyst(i)
+    case l: LocalDateTime => TimestampNTZConverter.toCatalyst(l)
     case d: BigDecimal => new DecimalConverter(DecimalType(d.precision, d.scale)).toCatalyst(d)
     case d: JavaBigDecimal => new DecimalConverter(DecimalType(d.precision, d.scale)).toCatalyst(d)
     case seq: Seq[Any] => new GenericArrayData(seq.map(convertToCatalyst).toArray)
     case r: Row => InternalRow(r.toSeq.map(convertToCatalyst): _*)
-    case arr: Array[Any] => new GenericArrayData(arr.map(convertToCatalyst))
-    case m: Map[_, _] =>
-      val length = m.size
-      val convertedKeys = new Array[Any](length)
-      val convertedValues = new Array[Any](length)
-
-      var i = 0
-      for ((key, value) <- m) {
-        convertedKeys(i) = convertToCatalyst(key)
-        convertedValues(i) = convertToCatalyst(value)
-        i += 1
-      }
-      ArrayBasedMapData(convertedKeys, convertedValues)
+    case arr: Array[Byte] => arr
+    case arr: Array[Char] => StringConverter.toCatalyst(arr)
+    case arr: Array[_] => new GenericArrayData(arr.map(convertToCatalyst))
+    case map: Map[_, _] =>
+      ArrayBasedMapData(
+        map,
+        (key: Any) => convertToCatalyst(key),
+        (value: Any) => convertToCatalyst(value))
+    case d: Duration => DurationConverter(SECOND).toCatalyst(d)
+    case p: Period => PeriodConverter(MONTH).toCatalyst(p)
     case other => other
   }
 

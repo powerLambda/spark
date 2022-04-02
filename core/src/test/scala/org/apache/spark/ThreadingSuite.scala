@@ -17,11 +17,10 @@
 
 package org.apache.spark
 
-import java.util.concurrent.{TimeUnit, Semaphore}
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.{Semaphore, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
-import org.apache.spark.scheduler._
+import org.apache.spark.internal.Logging
 
 /**
  * Holds state shared across task threads in some ThreadingSuite tests.
@@ -30,7 +29,7 @@ object ThreadingSuiteState {
   val runningThreads = new AtomicInteger
   val failed = new AtomicBoolean
 
-  def clear() {
+  def clear(): Unit = {
     runningThreads.set(0)
     failed.set(false)
   }
@@ -45,7 +44,7 @@ class ThreadingSuite extends SparkFunSuite with LocalSparkContext with Logging {
     @volatile var answer1: Int = 0
     @volatile var answer2: Int = 0
     new Thread {
-      override def run() {
+      override def run(): Unit = {
         answer1 = nums.reduce(_ + _)
         answer2 = nums.first()    // This will run "locally" in the current thread
         sem.release()
@@ -63,7 +62,7 @@ class ThreadingSuite extends SparkFunSuite with LocalSparkContext with Logging {
     @volatile var ok = true
     for (i <- 0 until 10) {
       new Thread {
-        override def run() {
+        override def run(): Unit = {
           val answer1 = nums.reduce(_ + _)
           if (answer1 != 55) {
             printf("In thread %d: answer1 was %d\n", i, answer1)
@@ -91,7 +90,7 @@ class ThreadingSuite extends SparkFunSuite with LocalSparkContext with Logging {
     @volatile var ok = true
     for (i <- 0 until 10) {
       new Thread {
-        override def run() {
+        override def run(): Unit = {
           val answer1 = nums.reduce(_ + _)
           if (answer1 != 55) {
             printf("In thread %d: answer1 was %d\n", i, answer1)
@@ -122,13 +121,14 @@ class ThreadingSuite extends SparkFunSuite with LocalSparkContext with Logging {
     var throwable: Option[Throwable] = None
     for (i <- 0 until 2) {
       new Thread {
-        override def run() {
+        override def run(): Unit = {
           try {
             val ans = nums.map(number => {
               val running = ThreadingSuiteState.runningThreads
               running.getAndIncrement()
-              val time = System.currentTimeMillis()
-              while (running.get() != 4 && System.currentTimeMillis() < time + 1000) {
+              val timeNs = System.nanoTime()
+              while (running.get() != 4 &&
+                (System.nanoTime() - timeNs < TimeUnit.SECONDS.toNanos(1))) {
                 Thread.sleep(100)
               }
               if (running.get() != 4) {
@@ -161,7 +161,7 @@ class ThreadingSuite extends SparkFunSuite with LocalSparkContext with Logging {
     var throwable: Option[Throwable] = None
     val threads = (1 to 5).map { i =>
       new Thread() {
-        override def run() {
+        override def run(): Unit = {
           try {
             sc.setLocalProperty("test", i.toString)
             assert(sc.getLocalProperty("test") === i.toString)
@@ -189,7 +189,7 @@ class ThreadingSuite extends SparkFunSuite with LocalSparkContext with Logging {
     var throwable: Option[Throwable] = None
     val threads = (1 to 5).map { i =>
       new Thread() {
-        override def run() {
+        override def run(): Unit = {
           try {
             assert(sc.getLocalProperty("test") === "parent")
             sc.setLocalProperty("test", i.toString)

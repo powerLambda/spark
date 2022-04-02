@@ -17,29 +17,27 @@
 
 """
 This is an example implementation of ALS for learning how to use Spark. Please refer to
-ALS in pyspark.mllib.recommendation for more conventional use.
+pyspark.ml.recommendation.ALS for more conventional use.
 
 This example requires numpy (http://www.numpy.org/)
 """
-from __future__ import print_function
-
 import sys
 
 import numpy as np
 from numpy.random import rand
 from numpy import matrix
-from pyspark import SparkContext
+from pyspark.sql import SparkSession
 
 LAMBDA = 0.01   # regularization
 np.random.seed(42)
 
 
-def rmse(R, ms, us):
+def rmse(R: np.ndarray, ms: np.ndarray, us: np.ndarray) -> np.float64:
     diff = R - ms * us.T
     return np.sqrt(np.sum(np.power(diff, 2)) / (M * U))
 
 
-def update(i, vec, mat, ratings):
+def update(i: int, mat: np.ndarray, ratings: np.ndarray) -> np.ndarray:
     uu = mat.shape[0]
     ff = mat.shape[1]
 
@@ -59,10 +57,16 @@ if __name__ == "__main__":
     """
 
     print("""WARN: This is a naive implementation of ALS and is given as an
-      example. Please use the ALS method found in pyspark.mllib.recommendation for more
+      example. Please use pyspark.ml.recommendation.ALS for more
       conventional use.""", file=sys.stderr)
 
-    sc = SparkContext(appName="PythonALS")
+    spark = SparkSession\
+        .builder\
+        .appName("PythonALS")\
+        .getOrCreate()
+
+    sc = spark.sparkContext
+
     M = int(sys.argv[1]) if len(sys.argv) > 1 else 100
     U = int(sys.argv[2]) if len(sys.argv) > 2 else 500
     F = int(sys.argv[3]) if len(sys.argv) > 3 else 10
@@ -73,30 +77,30 @@ if __name__ == "__main__":
           (M, U, F, ITERATIONS, partitions))
 
     R = matrix(rand(M, F)) * matrix(rand(U, F).T)
-    ms = matrix(rand(M, F))
-    us = matrix(rand(U, F))
+    ms: matrix = matrix(rand(M, F))
+    us: matrix = matrix(rand(U, F))
 
     Rb = sc.broadcast(R)
     msb = sc.broadcast(ms)
     usb = sc.broadcast(us)
 
     for i in range(ITERATIONS):
-        ms = sc.parallelize(range(M), partitions) \
-               .map(lambda x: update(x, msb.value[x, :], usb.value, Rb.value)) \
-               .collect()
+        ms_ = sc.parallelize(range(M), partitions) \
+            .map(lambda x: update(x, usb.value, Rb.value)) \
+            .collect()
         # collect() returns a list, so array ends up being
         # a 3-d array, we take the first 2 dims for the matrix
-        ms = matrix(np.array(ms)[:, :, 0])
+        ms = matrix(np.array(ms_)[:, :, 0])
         msb = sc.broadcast(ms)
 
-        us = sc.parallelize(range(U), partitions) \
-               .map(lambda x: update(x, usb.value[x, :], msb.value, Rb.value.T)) \
-               .collect()
-        us = matrix(np.array(us)[:, :, 0])
+        us_ = sc.parallelize(range(U), partitions) \
+            .map(lambda x: update(x, msb.value, Rb.value.T)) \
+            .collect()
+        us = matrix(np.array(us_)[:, :, 0])
         usb = sc.broadcast(us)
 
         error = rmse(R, ms, us)
         print("Iteration %d:" % i)
         print("\nRMSE: %5.4f\n" % error)
 
-    sc.stop()
+    spark.stop()

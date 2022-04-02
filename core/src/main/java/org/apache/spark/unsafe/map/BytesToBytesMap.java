@@ -31,14 +31,16 @@ import org.slf4j.LoggerFactory;
 import org.apache.spark.SparkEnv;
 import org.apache.spark.executor.ShuffleWriteMetrics;
 import org.apache.spark.memory.MemoryConsumer;
+import org.apache.spark.memory.SparkOutOfMemoryError;
 import org.apache.spark.memory.TaskMemoryManager;
+import org.apache.spark.serializer.SerializerManager;
 import org.apache.spark.storage.BlockManager;
 import org.apache.spark.unsafe.Platform;
+import org.apache.spark.unsafe.UnsafeAlignedOffset;
 import org.apache.spark.unsafe.array.ByteArrayMethods;
 import org.apache.spark.unsafe.array.LongArray;
 import org.apache.spark.unsafe.hash.Murmur3_x86_32;
 import org.apache.spark.unsafe.memory.MemoryBlock;
-import org.apache.spark.unsafe.memory.MemoryLocation;
 import org.apache.spark.util.collection.unsafe.sort.UnsafeSorterSpillReader;
 import org.apache.spark.util.collection.unsafe.sort.UnsafeSorterSpillWriter;
 
@@ -52,20 +54,19 @@ import org.apache.spark.util.collection.unsafe.sort.UnsafeSorterSpillWriter;
  * probably be using sorting instead of hashing for better cache locality.
  *
  * The key and values under the hood are stored together, in the following format:
- *   Bytes 0 to 4: len(k) (key length in bytes) + len(v) (value length in bytes) + 4
- *   Bytes 4 to 8: len(k)
- *   Bytes 8 to 8 + len(k): key data
- *   Bytes 8 + len(k) to 8 + len(k) + len(v): value data
+ *   First uaoSize bytes: len(k) (key length in bytes) + len(v) (value length in bytes) + uaoSize
+ *   Next uaoSize bytes: len(k)
+ *   Next len(k) bytes: key data
+ *   Next len(v) bytes: value data
+ *   Last 8 bytes: pointer to next pair
  *
- * This means that the first four bytes store the entire record (key + value) length. This format
- * is consistent with {@link org.apache.spark.util.collection.unsafe.sort.UnsafeExternalSorter},
+ * It means first uaoSize bytes store the entire record (key + value + uaoSize) length. This format
+ * is compatible with {@link org.apache.spark.util.collection.unsafe.sort.UnsafeExternalSorter},
  * so we can pass records from this map directly into the sorter to sort records in place.
  */
 public final class BytesToBytesMap extends MemoryConsumer {
 
-  private final Logger logger = LoggerFactory.getLogger(BytesToBytesMap.class);
-
-  private static final Murmur3_x86_32 HASHER = new Murmur3_x86_32(0);
+  private static final Logger logger = LoggerFactory.getLogger(BytesToBytesMap.class);
 
   private static final HashMapGrowthStrategy growthStrategy = HashMapGrowthStrategy.DOUBLING;
 
@@ -95,8 +96,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
    * since that's the largest power-of-2 that's less than Integer.MAX_VALUE. We need two long array
    * entries per key, giving us a maximum capacity of (1 &lt;&lt; 29).
    */
-  @VisibleForTesting
-  static final int MAX_CAPACITY = (1 << 29);
+  public static final int MAX_CAPACITY = (1 << 29);
 
   // This choice of page table size and page size means that we can address up to 500 gigabytes
   // of memory.
@@ -134,7 +134,12 @@ public final class BytesToBytesMap extends MemoryConsumer {
   /**
    * Number of keys defined in the map.
    */
-  private int numElements;
+  private int numKeys;
+
+  /**
+   * Number of values defined in the map. A key could have multiple values.
+   */
+  private int numValues;
 
   /**
    * The map will be expanded once the number of keys exceeds this threshold.
@@ -153,36 +158,33 @@ public final class BytesToBytesMap extends MemoryConsumer {
    */
   private final Location loc;
 
-  private final boolean enablePerfMetrics;
+  private long numProbes = 0L;
 
-  private long timeSpentResizingNs = 0;
-
-  private long numProbes = 0;
-
-  private long numKeyLookups = 0;
-
-  private long numHashCollisions = 0;
+  private long numKeyLookups = 0L;
 
   private long peakMemoryUsedBytes = 0L;
 
+  private final int initialCapacity;
+
   private final BlockManager blockManager;
+  private final SerializerManager serializerManager;
   private volatile MapIterator destructiveIterator = null;
   private LinkedList<UnsafeSorterSpillWriter> spillWriters = new LinkedList<>();
 
   public BytesToBytesMap(
       TaskMemoryManager taskMemoryManager,
       BlockManager blockManager,
+      SerializerManager serializerManager,
       int initialCapacity,
       double loadFactor,
-      long pageSizeBytes,
-      boolean enablePerfMetrics) {
-    super(taskMemoryManager, pageSizeBytes);
+      long pageSizeBytes) {
+    super(taskMemoryManager, pageSizeBytes, taskMemoryManager.getTungstenMemoryMode());
     this.taskMemoryManager = taskMemoryManager;
     this.blockManager = blockManager;
+    this.serializerManager = serializerManager;
     this.loadFactor = loadFactor;
     this.loc = new Location();
     this.pageSizeBytes = pageSizeBytes;
-    this.enablePerfMetrics = enablePerfMetrics;
     if (initialCapacity <= 0) {
       throw new IllegalArgumentException("Initial capacity must be greater than 0");
     }
@@ -194,6 +196,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
       throw new IllegalArgumentException("Page size " + pageSizeBytes + " cannot exceed " +
         TaskMemoryManager.MAXIMUM_PAGE_SIZE_BYTES);
     }
+    this.initialCapacity = initialCapacity;
     allocate(initialCapacity);
   }
 
@@ -201,27 +204,25 @@ public final class BytesToBytesMap extends MemoryConsumer {
       TaskMemoryManager taskMemoryManager,
       int initialCapacity,
       long pageSizeBytes) {
-    this(taskMemoryManager, initialCapacity, pageSizeBytes, false);
-  }
-
-  public BytesToBytesMap(
-      TaskMemoryManager taskMemoryManager,
-      int initialCapacity,
-      long pageSizeBytes,
-      boolean enablePerfMetrics) {
     this(
       taskMemoryManager,
       SparkEnv.get() != null ? SparkEnv.get().blockManager() :  null,
+      SparkEnv.get() != null ? SparkEnv.get().serializerManager() :  null,
       initialCapacity,
-      0.70,
-      pageSizeBytes,
-      enablePerfMetrics);
+      // In order to re-use the longArray for sorting, the load factor cannot be larger than 0.5.
+      0.5,
+      pageSizeBytes);
   }
 
   /**
    * Returns the number of keys defined in the map.
    */
-  public int numElements() { return numElements; }
+  public int numKeys() { return numKeys; }
+
+  /**
+   * Returns the number of values defined in the map. A key could have multiple values.
+   */
+  public int numValues() { return numValues; }
 
   public final class MapIterator implements Iterator<Location> {
 
@@ -244,42 +245,54 @@ public final class BytesToBytesMap extends MemoryConsumer {
       this.destructive = destructive;
       if (destructive) {
         destructiveIterator = this;
+        // longArray will not be used anymore if destructive is true, release it now.
+        if (longArray != null) {
+          freeArray(longArray);
+          longArray = null;
+        }
       }
     }
 
     private void advanceToNextPage() {
-      synchronized (this) {
-        int nextIdx = dataPages.indexOf(currentPage) + 1;
-        if (destructive && currentPage != null) {
-          dataPages.remove(currentPage);
-          freePage(currentPage);
-          nextIdx --;
-        }
-        if (dataPages.size() > nextIdx) {
-          currentPage = dataPages.get(nextIdx);
-          pageBaseObject = currentPage.getBaseObject();
-          offsetInPage = currentPage.getBaseOffset();
-          recordsInPage = Platform.getInt(pageBaseObject, offsetInPage);
-          offsetInPage += 4;
-        } else {
-          currentPage = null;
-          if (reader != null) {
-            // remove the spill file from disk
-            File file = spillWriters.removeFirst().getFile();
-            if (file != null && file.exists()) {
-              if (!file.delete()) {
-                logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
-              }
+      // SPARK-26265: We will first lock this `MapIterator` and then `TaskMemoryManager` when going
+      // to free a memory page by calling `freePage`. At the same time, it is possibly that another
+      // memory consumer first locks `TaskMemoryManager` and then this `MapIterator` when it
+      // acquires memory and causes spilling on this `MapIterator`. To avoid deadlock here, we keep
+      // reference to the page to free and free it after releasing the lock of `MapIterator`.
+      MemoryBlock pageToFree = null;
+
+      try {
+        synchronized (this) {
+          int nextIdx = dataPages.indexOf(currentPage) + 1;
+          if (destructive && currentPage != null) {
+            dataPages.remove(currentPage);
+            pageToFree = currentPage;
+            nextIdx--;
+          }
+          if (dataPages.size() > nextIdx) {
+            currentPage = dataPages.get(nextIdx);
+            pageBaseObject = currentPage.getBaseObject();
+            offsetInPage = currentPage.getBaseOffset();
+            recordsInPage = UnsafeAlignedOffset.getSize(pageBaseObject, offsetInPage);
+            offsetInPage += UnsafeAlignedOffset.getUaoSize();
+          } else {
+            currentPage = null;
+            if (reader != null) {
+              handleFailedDelete();
+            }
+            try {
+              Closeables.close(reader, /* swallowIOException = */ false);
+              reader = spillWriters.getFirst().getReader(serializerManager);
+              recordsInPage = -1;
+            } catch (IOException e) {
+              // Scala iterator does not handle exception
+              Platform.throwException(e);
             }
           }
-          try {
-            Closeables.close(reader, /* swallowIOException = */ false);
-            reader = spillWriters.getFirst().getReader(blockManager);
-            recordsInPage = -1;
-          } catch (IOException e) {
-            // Scala iterator does not handle exception
-            Platform.throwException(e);
-          }
+        }
+      } finally {
+        if (pageToFree != null) {
+          freePage(pageToFree);
         }
       }
     }
@@ -288,13 +301,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
     public boolean hasNext() {
       if (numRecords == 0) {
         if (reader != null) {
-          // remove the spill file from disk
-          File file = spillWriters.removeFirst().getFile();
-          if (file != null && file.exists()) {
-            if (!file.delete()) {
-              logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
-            }
-          }
+          handleFailedDelete();
         }
       }
       return numRecords > 0;
@@ -307,9 +314,10 @@ public final class BytesToBytesMap extends MemoryConsumer {
       }
       numRecords--;
       if (currentPage != null) {
-        int totalLength = Platform.getInt(pageBaseObject, offsetInPage);
+        int totalLength = UnsafeAlignedOffset.getSize(pageBaseObject, offsetInPage);
         loc.with(currentPage, offsetInPage);
-        offsetInPage += 4 + totalLength;
+        // [total size] [key size] [key] [value] [pointer to next]
+        offsetInPage += UnsafeAlignedOffset.getUaoSize() + totalLength + 8;
         recordsInPage --;
         return loc;
       } else {
@@ -333,54 +341,65 @@ public final class BytesToBytesMap extends MemoryConsumer {
       }
     }
 
-    public long spill(long numBytes) throws IOException {
-      synchronized (this) {
-        if (!destructive || dataPages.size() == 1) {
-          return 0L;
-        }
-
-        // TODO: use existing ShuffleWriteMetrics
-        ShuffleWriteMetrics writeMetrics = new ShuffleWriteMetrics();
-
-        long released = 0L;
-        while (dataPages.size() > 0) {
-          MemoryBlock block = dataPages.getLast();
-          // The currentPage is used, cannot be released
-          if (block == currentPage) {
-            break;
-          }
-
-          Object base = block.getBaseObject();
-          long offset = block.getBaseOffset();
-          int numRecords = Platform.getInt(base, offset);
-          offset += 4;
-          final UnsafeSorterSpillWriter writer =
-            new UnsafeSorterSpillWriter(blockManager, 32 * 1024, writeMetrics, numRecords);
-          while (numRecords > 0) {
-            int length = Platform.getInt(base, offset);
-            writer.write(base, offset + 4, length, 0);
-            offset += 4 + length;
-            numRecords--;
-          }
-          writer.close();
-          spillWriters.add(writer);
-
-          dataPages.removeLast();
-          released += block.size();
-          freePage(block);
-
-          if (released >= numBytes) {
-            break;
-          }
-        }
-
-        return released;
+    public synchronized long spill(long numBytes) throws IOException {
+      if (!destructive || dataPages.size() == 1) {
+        return 0L;
       }
+
+      updatePeakMemoryUsed();
+
+      // TODO: use existing ShuffleWriteMetrics
+      ShuffleWriteMetrics writeMetrics = new ShuffleWriteMetrics();
+
+      long released = 0L;
+      while (dataPages.size() > 0) {
+        MemoryBlock block = dataPages.getLast();
+        // The currentPage is used, cannot be released
+        if (block == currentPage) {
+          break;
+        }
+
+        Object base = block.getBaseObject();
+        long offset = block.getBaseOffset();
+        int numRecords = UnsafeAlignedOffset.getSize(base, offset);
+        int uaoSize = UnsafeAlignedOffset.getUaoSize();
+        offset += uaoSize;
+        final UnsafeSorterSpillWriter writer =
+                new UnsafeSorterSpillWriter(blockManager, 32 * 1024, writeMetrics, numRecords);
+        while (numRecords > 0) {
+          int length = UnsafeAlignedOffset.getSize(base, offset);
+          writer.write(base, offset + uaoSize, length, 0);
+          offset += uaoSize + length + 8;
+          numRecords--;
+        }
+        writer.close();
+        spillWriters.add(writer);
+
+        dataPages.removeLast();
+        released += block.size();
+        freePage(block);
+
+        if (released >= numBytes) {
+          break;
+        }
+      }
+
+      return released;
     }
 
     @Override
     public void remove() {
       throw new UnsupportedOperationException();
+    }
+
+    private void handleFailedDelete() {
+      if (spillWriters.size() > 0) {
+        // remove the spill file from disk
+        File file = spillWriters.removeFirst().getFile();
+        if (file != null && file.exists() && !file.delete()) {
+          logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
+        }
+      }
     }
   }
 
@@ -389,11 +408,11 @@ public final class BytesToBytesMap extends MemoryConsumer {
    *
    * For efficiency, all calls to `next()` will return the same {@link Location} object.
    *
-   * If any other lookups or operations are performed on this map while iterating over it, including
-   * `lookup()`, the behavior of the returned iterator is undefined.
+   * The returned iterator is thread-safe. However if the map is modified while iterating over it,
+   * the behavior of the returned iterator is undefined.
    */
   public MapIterator iterator() {
-    return new MapIterator(numElements, loc, false);
+    return new MapIterator(numValues, new Location(), false);
   }
 
   /**
@@ -403,21 +422,98 @@ public final class BytesToBytesMap extends MemoryConsumer {
    *
    * For efficiency, all calls to `next()` will return the same {@link Location} object.
    *
-   * If any other lookups or operations are performed on this map while iterating over it, including
-   * `lookup()`, the behavior of the returned iterator is undefined.
+   * The returned iterator is thread-safe. However if the map is modified while iterating over it,
+   * the behavior of the returned iterator is undefined.
    */
   public MapIterator destructiveIterator() {
-    return new MapIterator(numElements, loc, true);
+    updatePeakMemoryUsed();
+    return new MapIterator(numValues, new Location(), true);
+  }
+
+  /**
+   * Iterator for the entries of this map. This is to first iterate over key indices in
+   * `longArray` then accessing values in `dataPages`. NOTE: this is different from `MapIterator`
+   * in the sense that key index is preserved here
+   * (See `UnsafeHashedRelation` for example of usage).
+   */
+  public final class MapIteratorWithKeyIndex implements Iterator<Location> {
+
+    /**
+     * The index in `longArray` where the key is stored.
+     */
+    private int keyIndex = 0;
+
+    private int numRecords;
+    private final Location loc;
+
+    private MapIteratorWithKeyIndex() {
+      this.numRecords = numValues;
+      this.loc = new Location();
+    }
+
+    @Override
+    public boolean hasNext() {
+      return numRecords > 0;
+    }
+
+    @Override
+    public Location next() {
+      if (!loc.isDefined() || !loc.nextValue()) {
+        while (longArray.get(keyIndex * 2) == 0) {
+          keyIndex++;
+        }
+        loc.with(keyIndex, 0, true);
+        keyIndex++;
+      }
+      numRecords--;
+      return loc;
+    }
+  }
+
+  /**
+   * Returns an iterator for iterating over the entries of this map,
+   * by first iterating over the key index inside hash map's `longArray`.
+   *
+   * For efficiency, all calls to `next()` will return the same {@link Location} object.
+   *
+   * The returned iterator is NOT thread-safe. If the map is modified while iterating over it,
+   * the behavior of the returned iterator is undefined.
+   */
+  public MapIteratorWithKeyIndex iteratorWithKeyIndex() {
+    return new MapIteratorWithKeyIndex();
+  }
+
+  /**
+   * The maximum number of allowed keys index.
+   *
+   * The value of allowed keys index is in the range of [0, maxNumKeysIndex - 1].
+   */
+  public int maxNumKeysIndex() {
+    return (int) (longArray.size() / 2);
   }
 
   /**
    * Looks up a key, and return a {@link Location} handle that can be used to test existence
    * and read/write values.
    *
-   * This function always return the same {@link Location} instance to avoid object allocation.
+   * This function always returns the same {@link Location} instance to avoid object allocation.
+   * This function is not thread-safe.
    */
   public Location lookup(Object keyBase, long keyOffset, int keyLength) {
-    safeLookup(keyBase, keyOffset, keyLength, loc);
+    safeLookup(keyBase, keyOffset, keyLength, loc,
+      Murmur3_x86_32.hashUnsafeWords(keyBase, keyOffset, keyLength, 42));
+    return loc;
+  }
+
+  /**
+   * Looks up a key, and return a {@link Location} handle that can be used to test existence
+   * and read/write values.
+   *
+   * This function always returns the same {@link Location} instance to avoid object allocation.
+   * This function is not thread-safe.
+   */
+  public Location lookup(Object keyBase, long keyOffset, int keyLength, int hash) {
+    safeLookup(keyBase, keyOffset, keyLength, loc, hash);
     return loc;
   }
 
@@ -426,45 +522,34 @@ public final class BytesToBytesMap extends MemoryConsumer {
    *
    * This is a thread-safe version of `lookup`, could be used by multiple threads.
    */
-  public void safeLookup(Object keyBase, long keyOffset, int keyLength, Location loc) {
+  public void safeLookup(Object keyBase, long keyOffset, int keyLength, Location loc, int hash) {
     assert(longArray != null);
 
-    if (enablePerfMetrics) {
-      numKeyLookups++;
-    }
-    final int hashcode = HASHER.hashUnsafeWords(keyBase, keyOffset, keyLength);
-    int pos = hashcode & mask;
+    numKeyLookups++;
+
+    int pos = hash & mask;
     int step = 1;
     while (true) {
-      if (enablePerfMetrics) {
-        numProbes++;
-      }
+      numProbes++;
       if (longArray.get(pos * 2) == 0) {
         // This is a new key.
-        loc.with(pos, hashcode, false);
+        loc.with(pos, hash, false);
         return;
       } else {
         long stored = longArray.get(pos * 2 + 1);
-        if ((int) (stored) == hashcode) {
+        if ((int) (stored) == hash) {
           // Full hash code matches.  Let's compare the keys for equality.
-          loc.with(pos, hashcode, true);
+          loc.with(pos, hash, true);
           if (loc.getKeyLength() == keyLength) {
-            final MemoryLocation keyAddress = loc.getKeyAddress();
-            final Object storedkeyBase = keyAddress.getBaseObject();
-            final long storedkeyOffset = keyAddress.getBaseOffset();
             final boolean areEqual = ByteArrayMethods.arrayEquals(
               keyBase,
               keyOffset,
-              storedkeyBase,
-              storedkeyOffset,
+              loc.getKeyBase(),
+              loc.getKeyOffset(),
               keyLength
             );
             if (areEqual) {
               return;
-            } else {
-              if (enablePerfMetrics) {
-                numHashCollisions++;
-              }
             }
           }
         }
@@ -484,13 +569,14 @@ public final class BytesToBytesMap extends MemoryConsumer {
     private boolean isDefined;
     /**
      * The hashcode of the most recent key passed to
-     * {@link BytesToBytesMap#lookup(Object, long, int)}. Caching this hashcode here allows us to
-     * avoid re-hashing the key when storing a value for that key.
+     * {@link BytesToBytesMap#lookup(Object, long, int, int)}. Caching this hashcode here allows us
+     * to avoid re-hashing the key when storing a value for that key.
      */
     private int keyHashcode;
-    private final MemoryLocation keyMemoryLocation = new MemoryLocation();
-    private final MemoryLocation valueMemoryLocation = new MemoryLocation();
+    private Object baseObject;  // the base object for key and value
+    private long keyOffset;
     private int keyLength;
+    private long valueOffset;
     private int valueLength;
 
     /**
@@ -504,18 +590,16 @@ public final class BytesToBytesMap extends MemoryConsumer {
         taskMemoryManager.getOffsetInPage(fullKeyAddress));
     }
 
-    private void updateAddressesAndSizes(final Object base, final long offset) {
-      long position = offset;
-      final int totalLength = Platform.getInt(base, position);
-      position += 4;
-      keyLength = Platform.getInt(base, position);
-      position += 4;
-      valueLength = totalLength - keyLength - 4;
-
-      keyMemoryLocation.setObjAndOffset(base, position);
-
-      position += keyLength;
-      valueMemoryLocation.setObjAndOffset(base, position);
+    private void updateAddressesAndSizes(final Object base, long offset) {
+      baseObject = base;
+      final int totalLength = UnsafeAlignedOffset.getSize(base, offset);
+      int uaoSize = UnsafeAlignedOffset.getUaoSize();
+      offset += uaoSize;
+      keyLength = UnsafeAlignedOffset.getSize(base, offset);
+      offset += uaoSize;
+      keyOffset = offset;
+      valueOffset = offset + keyLength;
+      valueLength = totalLength - keyLength - uaoSize;
     }
 
     private Location with(int pos, int keyHashcode, boolean isDefined) {
@@ -543,11 +627,27 @@ public final class BytesToBytesMap extends MemoryConsumer {
     private Location with(Object base, long offset, int length) {
       this.isDefined = true;
       this.memoryPage = null;
-      keyLength = Platform.getInt(base, offset);
-      valueLength = length - 4 - keyLength;
-      keyMemoryLocation.setObjAndOffset(base, offset + 4);
-      valueMemoryLocation.setObjAndOffset(base, offset + 4 + keyLength);
+      baseObject = base;
+      int uaoSize = UnsafeAlignedOffset.getUaoSize();
+      keyOffset = offset + uaoSize;
+      keyLength = UnsafeAlignedOffset.getSize(base, offset);
+      valueOffset = offset + uaoSize + keyLength;
+      valueLength = length - uaoSize - keyLength;
       return this;
+    }
+
+    /**
+     * Find the next pair that has the same key as current one.
+     */
+    public boolean nextValue() {
+      assert isDefined;
+      long nextAddr = Platform.getLong(baseObject, valueOffset + valueLength);
+      if (nextAddr == 0) {
+        return false;
+      } else {
+        updateAddressesAndSizes(nextAddr);
+        return true;
+      }
     }
 
     /**
@@ -566,14 +666,43 @@ public final class BytesToBytesMap extends MemoryConsumer {
     }
 
     /**
-     * Returns the address of the key defined at this position.
-     * This points to the first byte of the key data.
-     * Unspecified behavior if the key is not defined.
-     * For efficiency reasons, calls to this method always returns the same MemoryLocation object.
+     * Returns index for key.
      */
-    public MemoryLocation getKeyAddress() {
+    public int getKeyIndex() {
       assert (isDefined);
-      return keyMemoryLocation;
+      return pos;
+    }
+
+    /**
+     * Returns the base object for key.
+     */
+    public Object getKeyBase() {
+      assert (isDefined);
+      return baseObject;
+    }
+
+    /**
+     * Returns the offset for key.
+     */
+    public long getKeyOffset() {
+      assert (isDefined);
+      return keyOffset;
+    }
+
+    /**
+     * Returns the base object for value.
+     */
+    public Object getValueBase() {
+      assert (isDefined);
+      return baseObject;
+    }
+
+    /**
+     * Returns the offset for value.
+     */
+    public long getValueOffset() {
+      assert (isDefined);
+      return valueOffset;
     }
 
     /**
@@ -586,17 +715,6 @@ public final class BytesToBytesMap extends MemoryConsumer {
     }
 
     /**
-     * Returns the address of the value defined at this position.
-     * This points to the first byte of the value data.
-     * Unspecified behavior if the key is not defined.
-     * For efficiency reasons, calls to this method always returns the same MemoryLocation object.
-     */
-    public MemoryLocation getValueAddress() {
-      assert (isDefined);
-      return valueMemoryLocation;
-    }
-
-    /**
      * Returns the length of the value defined at this position.
      * Unspecified behavior if the key is not defined.
      */
@@ -606,19 +724,18 @@ public final class BytesToBytesMap extends MemoryConsumer {
     }
 
     /**
-     * Store a new key and value. This method may only be called once for a given key; if you want
-     * to update the value associated with a key, then you can directly manipulate the bytes stored
-     * at the value address. The return value indicates whether the put succeeded or whether it
-     * failed because additional memory could not be acquired.
+     * Append a new value for the key. This method could be called multiple times for a given key.
+     * The return value indicates whether the put succeeded or whether it failed because additional
+     * memory could not be acquired.
      * <p>
      * It is only valid to call this method immediately after calling `lookup()` using the same key.
      * </p>
      * <p>
-     * The key and value must be word-aligned (that is, their sizes must multiples of 8).
+     * The key and value must be word-aligned (that is, their sizes must be a multiple of 8).
      * </p>
      * <p>
      * After calling this method, calls to `get[Key|Value]Address()` and `get[Key|Value]Length`
-     * will return information on the data stored by this `putNewKey` call.
+     * will return information on the data stored by this `append` call.
      * </p>
      * <p>
      * As an example usage, here's the proper way to store a new key:
@@ -626,7 +743,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
      * <pre>
      *   Location loc = map.lookup(keyBase, keyOffset, keyLength);
      *   if (!loc.isDefined()) {
-     *     if (!loc.putNewKey(keyBase, keyOffset, keyLength, ...)) {
+     *     if (!loc.append(keyBase, keyOffset, keyLength, ...)) {
      *       // handle failure to grow map (by spilling, for example)
      *     }
      *   }
@@ -638,28 +755,29 @@ public final class BytesToBytesMap extends MemoryConsumer {
      * @return true if the put() was successful and false if the put() failed because memory could
      *         not be acquired.
      */
-    public boolean putNewKey(Object keyBase, long keyOffset, int keyLength,
-        Object valueBase, long valueOffset, int valueLength) {
-      assert (!isDefined) : "Can only set value once for a key";
-      assert (keyLength % 8 == 0);
-      assert (valueLength % 8 == 0);
-      assert(longArray != null);
+    public boolean append(Object kbase, long koff, int klen, Object vbase, long voff, int vlen) {
+      assert (klen % 8 == 0);
+      assert (vlen % 8 == 0);
+      assert (longArray != null);
 
-
-      if (numElements == MAX_CAPACITY
+      // We should not increase number of keys to be MAX_CAPACITY. The usage pattern of this map is
+      // lookup + append. If we append key until the number of keys to be MAX_CAPACITY, next time
+      // the call of lookup will hang forever because it cannot find an empty slot.
+      if (numKeys == MAX_CAPACITY - 1
         // The map could be reused from last spill (because of no enough memory to grow),
         // then we don't try to grow again if hit the `growthThreshold`.
-        || !canGrowArray && numElements > growthThreshold) {
+        || !canGrowArray && numKeys >= growthThreshold) {
         return false;
       }
 
       // Here, we'll copy the data into our data pages. Because we only store a relative offset from
       // the key address instead of storing the absolute address of the value, the key and value
       // must be stored in the same memory page.
-      // (8 byte key length) (key) (value)
-      final long recordLength = 8 + keyLength + valueLength;
+      // (total length) (key length) (key) (value) (8 byte pointer to next value)
+      int uaoSize = UnsafeAlignedOffset.getUaoSize();
+      final long recordLength = (2L * uaoSize) + klen + vlen + 8;
       if (currentPage == null || currentPage.size() - pageCursor < recordLength) {
-        if (!acquireNewPage(recordLength + 4L)) {
+        if (!acquireNewPage(recordLength + uaoSize)) {
           return false;
         }
       }
@@ -668,30 +786,47 @@ public final class BytesToBytesMap extends MemoryConsumer {
       final Object base = currentPage.getBaseObject();
       long offset = currentPage.getBaseOffset() + pageCursor;
       final long recordOffset = offset;
-      Platform.putInt(base, offset, keyLength + valueLength + 4);
-      Platform.putInt(base, offset + 4, keyLength);
-      offset += 8;
-      Platform.copyMemory(keyBase, keyOffset, base, offset, keyLength);
-      offset += keyLength;
-      Platform.copyMemory(valueBase, valueOffset, base, offset, valueLength);
+      UnsafeAlignedOffset.putSize(base, offset, klen + vlen + uaoSize);
+      UnsafeAlignedOffset.putSize(base, offset + uaoSize, klen);
+      offset += (2L * uaoSize);
+      Platform.copyMemory(kbase, koff, base, offset, klen);
+      offset += klen;
+      Platform.copyMemory(vbase, voff, base, offset, vlen);
+      offset += vlen;
+      // put this value at the beginning of the list
+      Platform.putLong(base, offset, isDefined ? longArray.get(pos * 2) : 0);
 
-      // --- Update bookkeeping data structures -----------------------------------------------------
+      // --- Update bookkeeping data structures ----------------------------------------------------
       offset = currentPage.getBaseOffset();
-      Platform.putInt(base, offset, Platform.getInt(base, offset) + 1);
+      UnsafeAlignedOffset.putSize(base, offset, UnsafeAlignedOffset.getSize(base, offset) + 1);
       pageCursor += recordLength;
-      numElements++;
       final long storedKeyAddress = taskMemoryManager.encodePageNumberAndOffset(
         currentPage, recordOffset);
       longArray.set(pos * 2, storedKeyAddress);
-      longArray.set(pos * 2 + 1, keyHashcode);
       updateAddressesAndSizes(storedKeyAddress);
-      isDefined = true;
+      numValues++;
+      if (!isDefined) {
+        numKeys++;
+        longArray.set(pos * 2 + 1, keyHashcode);
+        isDefined = true;
 
-      if (numElements > growthThreshold && longArray.size() < MAX_CAPACITY) {
-        try {
-          growAndRehash();
-        } catch (OutOfMemoryError oom) {
-          canGrowArray = false;
+        // If the map has reached its growth threshold, try to grow it.
+        if (numKeys >= growthThreshold) {
+          // We use two array entries per key, so the array size is twice the capacity.
+          // We should compare the current capacity of the array, instead of its size.
+          if (longArray.size() / 2 < MAX_CAPACITY) {
+            try {
+              growAndRehash();
+            } catch (SparkOutOfMemoryError oom) {
+              canGrowArray = false;
+            }
+          } else {
+            // The map is already at MAX_CAPACITY and cannot grow. Instead, we prevent it from
+            // accepting any more new elements to make sure we don't exceed the load factor. If we
+            // need to spill later, this allows UnsafeKVExternalSorter to reuse the array for
+            // sorting.
+            canGrowArray = false;
+          }
         }
       }
       return true;
@@ -705,12 +840,12 @@ public final class BytesToBytesMap extends MemoryConsumer {
   private boolean acquireNewPage(long required) {
     try {
       currentPage = allocatePage(required);
-    } catch (OutOfMemoryError e) {
+    } catch (SparkOutOfMemoryError e) {
       return false;
     }
     dataPages.add(currentPage);
-    Platform.putInt(currentPage.getBaseObject(), currentPage.getBaseOffset(), 0);
-    pageCursor = 4;
+    UnsafeAlignedOffset.putSize(currentPage.getBaseObject(), currentPage.getBaseOffset(), 0);
+    pageCursor = UnsafeAlignedOffset.getUaoSize();
     return true;
   }
 
@@ -732,7 +867,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
     assert (capacity >= 0);
     capacity = Math.max((int) Math.min(MAX_CAPACITY, ByteArrayMethods.nextPowerOf2(capacity)), 64);
     assert (capacity <= MAX_CAPACITY);
-    longArray = allocateArray(capacity * 2);
+    longArray = allocateArray(capacity * 2L);
     longArray.zeroOut();
 
     this.growthThreshold = (int) (capacity * loadFactor);
@@ -804,30 +939,10 @@ public final class BytesToBytesMap extends MemoryConsumer {
   }
 
   /**
-   * Returns the total amount of time spent resizing this map (in nanoseconds).
-   */
-  public long getTimeSpentResizingNs() {
-    if (!enablePerfMetrics) {
-      throw new IllegalStateException();
-    }
-    return timeSpentResizingNs;
-  }
-
-  /**
    * Returns the average number of probes per key lookup.
    */
-  public double getAverageProbesPerLookup() {
-    if (!enablePerfMetrics) {
-      throw new IllegalStateException();
-    }
+  public double getAvgHashProbesPerKey() {
     return (1.0 * numProbes) / numKeyLookups;
-  }
-
-  public long getNumHashCollisions() {
-    if (!enablePerfMetrics) {
-      throw new IllegalStateException();
-    }
-    return numHashCollisions;
   }
 
   @VisibleForTesting
@@ -847,13 +962,17 @@ public final class BytesToBytesMap extends MemoryConsumer {
    * Reset this map to initialized state.
    */
   public void reset() {
-    numElements = 0;
-    longArray.zeroOut();
-
+    updatePeakMemoryUsed();
+    numKeys = 0;
+    numValues = 0;
+    freeArray(longArray);
+    longArray = null;
     while (dataPages.size() > 0) {
       MemoryBlock dataPage = dataPages.removeLast();
       freePage(dataPage);
     }
+    allocate(initialCapacity);
+    canGrowArray = true;
     currentPage = null;
     pageCursor = 0;
   }
@@ -865,10 +984,6 @@ public final class BytesToBytesMap extends MemoryConsumer {
   void growAndRehash() {
     assert(longArray != null);
 
-    long resizeStartTime = -1;
-    if (enablePerfMetrics) {
-      resizeStartTime = System.nanoTime();
-    }
     // Store references to the old data structures to be used when we re-hash
     final LongArray oldLongArray = longArray;
     final int oldCapacity = (int) oldLongArray.size() / 2;
@@ -893,9 +1008,5 @@ public final class BytesToBytesMap extends MemoryConsumer {
       longArray.set(newPos * 2 + 1, hashcode);
     }
     freeArray(oldLongArray);
-
-    if (enablePerfMetrics) {
-      timeSpentResizingNs += System.nanoTime() - resizeStartTime;
-    }
   }
 }

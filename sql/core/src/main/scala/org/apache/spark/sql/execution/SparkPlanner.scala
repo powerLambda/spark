@@ -17,29 +17,53 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.SparkContext
 import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.execution.datasources.DataSourceStrategy
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.execution.adaptive.LogicalQueryStageStrategy
+import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourceStrategy}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Strategy
 
-class SparkPlanner(val sqlContext: SQLContext) extends SparkStrategies {
-  val sparkContext: SparkContext = sqlContext.sparkContext
+class SparkPlanner(val session: SparkSession, val experimentalMethods: ExperimentalMethods)
+  extends SparkStrategies with SQLConfHelper {
 
-  def numPartitions: Int = sqlContext.conf.numShufflePartitions
+  def numPartitions: Int = conf.numShufflePartitions
 
-  def strategies: Seq[Strategy] =
-    sqlContext.experimental.extraStrategies ++ (
+  override def strategies: Seq[Strategy] =
+    experimentalMethods.extraStrategies ++
+      extraPlanningStrategies ++ (
+      LogicalQueryStageStrategy ::
+      PythonEvals ::
+      new DataSourceV2Strategy(session) ::
+      FileSourceStrategy ::
       DataSourceStrategy ::
-      DDLStrategy ::
-      TakeOrderedAndProject ::
+      SpecialLimits ::
       Aggregation ::
-      LeftSemiJoin ::
-      EquiJoinSelection ::
+      Window ::
+      JoinSelection ::
       InMemoryScans ::
-      BasicOperators ::
-      BroadcastNestedLoop ::
-      CartesianProduct ::
-      DefaultJoin :: Nil)
+      SparkScripts ::
+      WithCTEStrategy ::
+      BasicOperators :: Nil)
+
+  /**
+   * Override to add extra planning strategies to the planner. These strategies are tried after
+   * the strategies defined in [[ExperimentalMethods]], and before the regular strategies.
+   */
+  def extraPlanningStrategies: Seq[Strategy] = Nil
+
+  override protected def collectPlaceholders(plan: SparkPlan): Seq[(SparkPlan, LogicalPlan)] = {
+    plan.collect {
+      case placeholder @ PlanLater(logicalPlan) => placeholder -> logicalPlan
+    }
+  }
+
+  override protected def prunePlans(plans: Iterator[SparkPlan]): Iterator[SparkPlan] = {
+    // TODO: We will need to prune bad plans when we improve plan space exploration
+    //       to prevent combinatorial explosion.
+    plans
+  }
 
   /**
    * Used to build table scan operators where complex projection and filtering are done using
@@ -77,10 +101,10 @@ class SparkPlanner(val sqlContext: SQLContext) extends SparkStrategies {
       // when the columns of this projection are enough to evaluate all filter conditions,
       // just do a scan followed by a filter, with no extra project.
       val scan = scanBuilder(projectList.asInstanceOf[Seq[Attribute]])
-      filterCondition.map(Filter(_, scan)).getOrElse(scan)
+      filterCondition.map(FilterExec(_, scan)).getOrElse(scan)
     } else {
       val scan = scanBuilder((projectSet ++ filterSet).toSeq)
-      Project(projectList, filterCondition.map(Filter(_, scan)).getOrElse(scan))
+      ProjectExec(projectList, filterCondition.map(FilterExec(_, scan)).getOrElse(scan))
     }
   }
 }

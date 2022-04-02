@@ -19,29 +19,46 @@ package org.apache.spark.ml.regression
 
 import scala.util.Random
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.ml.linalg.{Vector, Vectors}
 import org.apache.spark.ml.param.ParamsSuite
-import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTestingUtils}
-import org.apache.spark.mllib.linalg.{Vector, Vectors}
+import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTest, MLTestingUtils}
+import org.apache.spark.ml.util.TestingUtils._
 import org.apache.spark.mllib.random.{ExponentialGenerator, WeibullGenerator}
-import org.apache.spark.mllib.util.MLlibTestSparkContext
-import org.apache.spark.mllib.util.TestingUtils._
 import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.functions.{col, lit}
+import org.apache.spark.sql.types._
 
-class AFTSurvivalRegressionSuite
-  extends SparkFunSuite with MLlibTestSparkContext with DefaultReadWriteTest {
+class AFTSurvivalRegressionSuite extends MLTest with DefaultReadWriteTest {
+
+  import testImplicits._
 
   @transient var datasetUnivariate: DataFrame = _
   @transient var datasetMultivariate: DataFrame = _
+  @transient var datasetUnivariateScaled: DataFrame = _
 
   override def beforeAll(): Unit = {
     super.beforeAll()
-    datasetUnivariate = sqlContext.createDataFrame(
-      sc.parallelize(generateAFTInput(
-        1, Array(5.5), Array(0.8), 1000, 42, 1.0, 2.0, 2.0)))
-    datasetMultivariate = sqlContext.createDataFrame(
-      sc.parallelize(generateAFTInput(
-        2, Array(0.9, -1.3), Array(0.7, 1.2), 1000, 42, 1.5, 2.5, 2.0)))
+    datasetUnivariate = generateAFTInput(
+      1, Array(5.5), Array(0.8), 1000, 42, 1.0, 2.0, 2.0).toDF()
+    datasetMultivariate = generateAFTInput(
+      2, Array(0.9, -1.3), Array(0.7, 1.2), 1000, 42, 1.5, 2.5, 2.0).toDF()
+    datasetUnivariateScaled = sc.parallelize(
+      generateAFTInput(1, Array(5.5), Array(0.8), 1000, 42, 1.0, 2.0, 2.0)).map { x =>
+        AFTPoint(Vectors.dense(x.features(0) * 1.0E3), x.label, x.censor)
+      }.toDF()
+  }
+
+  /**
+   * Enable the ignored test to export the dataset into CSV format,
+   * so we can validate the training accuracy compared with R's survival package.
+   */
+  ignore("export test data into CSV format") {
+    datasetUnivariate.rdd.map { case Row(features: Vector, label: Double, censor: Double) =>
+      features.toArray.mkString(",") + "," + censor + "," + label
+    }.repartition(1).saveAsTextFile("target/tmp/AFTSurvivalRegressionSuite/datasetUnivariate")
+    datasetMultivariate.rdd.map { case Row(features: Vector, label: Double, censor: Double) =>
+      features.toArray.mkString(",") + "," + censor + "," + label
+    }.repartition(1).saveAsTextFile("target/tmp/AFTSurvivalRegressionSuite/datasetMultivariate")
   }
 
   test("params") {
@@ -63,8 +80,7 @@ class AFTSurvivalRegressionSuite
       .setQuantilesCol("quantiles")
       .fit(datasetUnivariate)
 
-    // copied model must have the same parent.
-    MLTestingUtils.checkCopy(model)
+    MLTestingUtils.checkCopyAndUids(aftr, model)
 
     model.transform(datasetUnivariate)
       .select("label", "prediction", "quantiles")
@@ -75,6 +91,43 @@ class AFTSurvivalRegressionSuite
     assert(model.getQuantilesCol === "quantiles")
     assert(model.intercept !== 0.0)
     assert(model.hasParent)
+  }
+
+  test("AFTSurvivalRegression validate input dataset") {
+    testInvalidRegressionLabels { df: DataFrame =>
+      val dfWithCensors = df.withColumn("censor", lit(1.0))
+      new AFTSurvivalRegression().fit(dfWithCensors)
+    }
+
+    testInvalidVectors { df: DataFrame =>
+      val dfWithCensors = df.withColumn("censor", lit(1.0))
+      new AFTSurvivalRegression().fit(dfWithCensors)
+    }
+
+    // censors contains NULL
+    val df1 = sc.parallelize(Seq(
+      (1.0, null, Vectors.dense(1.0, 2.0)),
+      (1.0, "1.0", Vectors.dense(1.0, 2.0))
+    )).toDF("label", "str_censor", "features")
+      .select(col("label"), col("str_censor").cast("double").as("censor"), col("features"))
+    val e1 = intercept[Exception](new AFTSurvivalRegression().fit(df1))
+    assert(e1.getMessage.contains("Censors MUST NOT be Null or NaN"))
+
+    // censors contains NaN
+    val df2 = sc.parallelize(Seq(
+      (1.0, Double.NaN, Vectors.dense(1.0, 2.0)),
+      (1.0, 1.0, Vectors.dense(1.0, 2.0))
+    )).toDF("label", "censor", "features")
+    val e2 = intercept[Exception](new AFTSurvivalRegression().fit(df2))
+    assert(e2.getMessage.contains("Censors MUST NOT be Null or NaN"))
+
+    // censors contains invalid value: 3
+    val df3 = sc.parallelize(Seq(
+      (1.0, 1.0, Vectors.dense(1.0, 2.0)),
+      (1.0, 3.0, Vectors.dense(1.0, 2.0))
+    )).toDF("label", "censor", "features")
+    val e3 = intercept[Exception](new AFTSurvivalRegression().fit(df3))
+    assert(e3.getMessage.contains("Censors MUST be in {0, 1}"))
   }
 
   def generateAFTInput(
@@ -114,9 +167,9 @@ class AFTSurvivalRegressionSuite
   test("aft survival regression with univariate") {
     val quantileProbabilities = Array(0.1, 0.5, 0.9)
     val trainer = new AFTSurvivalRegression()
-      .setQuantileProbabilities(quantileProbabilities)
       .setQuantilesCol("quantiles")
     val model = trainer.fit(datasetUnivariate)
+    model.setQuantileProbabilities(quantileProbabilities)
 
     /*
        Using the following R code to load the data and train the model using survival package.
@@ -172,8 +225,8 @@ class AFTSurvivalRegressionSuite
     assert(model.predict(features) ~== responsePredictR relTol 1E-3)
     assert(model.predictQuantiles(features) ~== quantilePredictR relTol 1E-3)
 
-    model.transform(datasetUnivariate).select("features", "prediction", "quantiles")
-      .collect().foreach {
+    testTransformer[(Vector, Double, Double)](datasetUnivariate, model,
+      "features", "prediction", "quantiles") {
         case Row(features: Vector, prediction: Double, quantiles: Vector) =>
           assert(prediction ~== model.predict(features) relTol 1E-5)
           assert(quantiles ~== model.predictQuantiles(features) relTol 1E-5)
@@ -242,8 +295,8 @@ class AFTSurvivalRegressionSuite
     assert(model.predict(features) ~== responsePredictR relTol 1E-3)
     assert(model.predictQuantiles(features) ~== quantilePredictR relTol 1E-3)
 
-    model.transform(datasetMultivariate).select("features", "prediction", "quantiles")
-      .collect().foreach {
+    testTransformer[(Vector, Double, Double)](datasetMultivariate, model,
+      "features", "prediction", "quantiles") {
         case Row(features: Vector, prediction: Double, quantiles: Vector) =>
           assert(prediction ~== model.predict(features) relTol 1E-5)
           assert(quantiles ~== model.predictQuantiles(features) relTol 1E-5)
@@ -312,8 +365,8 @@ class AFTSurvivalRegressionSuite
     assert(model.predict(features) ~== responsePredictR relTol 1E-3)
     assert(model.predictQuantiles(features) ~== quantilePredictR relTol 1E-3)
 
-    model.transform(datasetMultivariate).select("features", "prediction", "quantiles")
-      .collect().foreach {
+    testTransformer[(Vector, Double, Double)](datasetMultivariate, model,
+      "features", "prediction", "quantiles") {
         case Row(features: Vector, prediction: Double, quantiles: Vector) =>
           assert(prediction ~== model.predict(features) relTol 1E-5)
           assert(quantiles ~== model.predictQuantiles(features) relTol 1E-5)
@@ -334,6 +387,60 @@ class AFTSurvivalRegressionSuite
     }
   }
 
+  test("should support all NumericType labels, and not support other types") {
+    val aft = new AFTSurvivalRegression().setMaxIter(1)
+    MLTestingUtils.checkNumericTypes[AFTSurvivalRegressionModel, AFTSurvivalRegression](
+      aft, spark, isClassification = false) { (expected, actual) =>
+        assert(expected.intercept === actual.intercept)
+        assert(expected.coefficients === actual.coefficients)
+      }
+  }
+
+  test("should support all NumericType censors, and not support other types") {
+    val df = spark.createDataFrame(Seq(
+      (1, Vectors.dense(1)),
+      (2, Vectors.dense(2)),
+      (3, Vectors.dense(3)),
+      (4, Vectors.dense(4))
+    )).toDF("label", "features")
+      .withColumn("censor", lit(0.0))
+    val aft = new AFTSurvivalRegression().setMaxIter(1)
+    val expected = aft.fit(df)
+
+    val types = Seq(ShortType, LongType, IntegerType, FloatType, ByteType, DecimalType(10, 0))
+    types.foreach { t =>
+      val actual = aft.fit(df.select(col("label"), col("features"),
+        col("censor").cast(t)))
+      assert(expected.intercept === actual.intercept)
+      assert(expected.coefficients === actual.coefficients)
+    }
+
+    val dfWithStringCensors = spark.createDataFrame(Seq(
+      (0, Vectors.dense(0, 2, 3), "0")
+    )).toDF("label", "features", "censor")
+    val thrown = intercept[IllegalArgumentException] {
+      aft.fit(dfWithStringCensors)
+    }
+    assert(thrown.getMessage.contains(
+      "Column censor must be of type numeric but was actually of type string"))
+  }
+
+  test("numerical stability of standardization") {
+    val trainer = new AFTSurvivalRegression()
+    val model1 = trainer.fit(datasetUnivariate)
+    val model2 = trainer.fit(datasetUnivariateScaled)
+
+    /**
+     * During training we standardize the dataset first, so no matter how we multiple
+     * a scaling factor into the dataset, the convergence rate should be the same,
+     * and the coefficients should equal to the original coefficients multiple by
+     * the scaling factor. It will have no effect on the intercept and scale.
+     */
+    assert(model1.coefficients(0) ~== model2.coefficients(0) * 1.0E3 absTol 0.01)
+    assert(model1.intercept ~== model2.intercept absTol 0.01)
+    assert(model1.scale ~== model2.scale absTol 0.01)
+  }
+
   test("read/write") {
     def checkModelData(
         model: AFTSurvivalRegressionModel,
@@ -344,7 +451,35 @@ class AFTSurvivalRegressionSuite
     }
     val aft = new AFTSurvivalRegression()
     testEstimatorAndModelReadWrite(aft, datasetMultivariate,
-      AFTSurvivalRegressionSuite.allParamSettings, checkModelData)
+      AFTSurvivalRegressionSuite.allParamSettings, AFTSurvivalRegressionSuite.allParamSettings,
+      checkModelData)
+  }
+
+  test("SPARK-15892: Incorrectly merged AFTAggregator with zero total count") {
+    // This `dataset` will contain an empty partition because it has two rows but
+    // the parallelism is bigger than that. Because the issue was about `AFTAggregator`s
+    // being merged incorrectly when it has an empty partition, running the codes below
+    // should not throw an exception.
+    val dataset = sc.parallelize(generateAFTInput(
+      1, Array(5.5), Array(0.8), 2, 42, 1.0, 2.0, 2.0), numSlices = 3).toDF()
+    val trainer = new AFTSurvivalRegression()
+    trainer.fit(dataset)
+  }
+
+  test("AFTSurvivalRegression on blocks") {
+    val quantileProbabilities = Array(0.1, 0.5, 0.9)
+    for (dataset <- Seq(datasetUnivariate, datasetUnivariateScaled, datasetMultivariate)) {
+      val aft = new AFTSurvivalRegression()
+        .setQuantileProbabilities(quantileProbabilities)
+        .setQuantilesCol("quantiles")
+      val model = aft.fit(dataset)
+      Seq(0, 0.01, 0.1, 1, 2, 4).foreach { s =>
+        val model2 = aft.setMaxBlockSizeInMB(s).fit(dataset)
+        assert(model.coefficients ~== model2.coefficients relTol 1e-9)
+        assert(model.intercept ~== model2.intercept relTol 1e-9)
+        assert(model.scale ~== model2.scale relTol 1e-9)
+      }
+    }
   }
 }
 

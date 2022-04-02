@@ -20,7 +20,8 @@ package org.apache.spark.streaming.scheduler.rate
 import scala.util.Random
 
 import org.scalatest.Inspectors.forAll
-import org.scalatest.Matchers
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.streaming.Seconds
@@ -119,7 +120,7 @@ class PIDRateEstimatorSuite extends SparkFunSuite with Matchers {
 
   test("with no accumulated but some positive error, |I| > 0, follow the processing speed") {
     val p = new PIDRateEstimator(20, 1D, 1D, 0D, 10)
-    // prepare a series of batch updates, one every 20ms with an decreasing number of processed
+    // prepare a series of batch updates, one every 20ms with a decreasing number of processed
     // elements in each batch, but constant processing time, and no accumulated error. Even though
     // the integral part is non-zero, the estimated rate should follow only the proportional term,
     // asking for less and less elements

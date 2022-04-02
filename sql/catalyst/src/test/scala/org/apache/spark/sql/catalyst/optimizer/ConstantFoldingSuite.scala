@@ -17,23 +17,24 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
-import org.apache.spark.sql.catalyst.analysis.{UnresolvedExtractValue, EliminateSubQueries}
-import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, LogicalPlan}
-import org.apache.spark.sql.catalyst.plans.PlanTest
-import org.apache.spark.sql.catalyst.rules.RuleExecutor
-import org.apache.spark.sql.types._
-
-// For implicit conversions
-import org.apache.spark.sql.catalyst.dsl.plans._
+import org.apache.spark.sql.catalyst.analysis.{EliminateSubqueryAliases, UnresolvedExtractValue}
 import org.apache.spark.sql.catalyst.dsl.expressions._
+import org.apache.spark.sql.catalyst.dsl.plans._
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.objects.{Invoke, NewInstance, StaticInvoke}
+import org.apache.spark.sql.catalyst.plans.PlanTest
+import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, LogicalPlan}
+import org.apache.spark.sql.catalyst.rules.RuleExecutor
+import org.apache.spark.sql.catalyst.util.GenericArrayData
+import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.ByteArray
 
 class ConstantFoldingSuite extends PlanTest {
 
   object Optimize extends RuleExecutor[LogicalPlan] {
     val batches =
       Batch("AnalysisNodes", Once,
-        EliminateSubQueries) ::
+        EliminateSubqueryAliases) ::
       Batch("ConstantFolding", Once,
         OptimizeIn,
         ConstantFolding,
@@ -143,7 +144,7 @@ class ConstantFoldingSuite extends PlanTest {
       testRelation
         .select(
           Cast(Literal("2"), IntegerType) + Literal(3) + 'a as Symbol("c1"),
-          Coalesce(Seq(Cast(Literal("abc"), IntegerType), Literal(3))) as Symbol("c2"))
+          Coalesce(Seq(TryCast(Literal("abc"), IntegerType), Literal(3))) as Symbol("c2"))
 
     val optimized = Optimize.execute(originalQuery.analyze)
 
@@ -198,8 +199,8 @@ class ConstantFoldingSuite extends PlanTest {
       EqualTo(Literal.create(null, IntegerType), 1) as 'c11,
       EqualTo(1, Literal.create(null, IntegerType)) as 'c12,
 
-      Like(Literal.create(null, StringType), "abc") as 'c13,
-      Like("abc", Literal.create(null, StringType)) as 'c14,
+      new Like(Literal.create(null, StringType), "abc") as 'c13,
+      new Like("abc", Literal.create(null, StringType)) as 'c14,
 
       Upper(Literal.create(null, StringType)) as 'c15,
 
@@ -261,6 +262,79 @@ class ConstantFoldingSuite extends PlanTest {
       testRelation
         .select('a)
         .where(Literal(true))
+        .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("SPARK-33544: Constant folding test with side effects") {
+    val originalQuery =
+      testRelation
+        .select('a)
+        .where(Size(CreateArray(Seq(AssertTrue(false)))) > 0)
+
+    val optimized = Optimize.execute(originalQuery.analyze)
+    comparePlans(optimized, originalQuery.analyze)
+  }
+
+  object OptimizeForCreate extends RuleExecutor[LogicalPlan] {
+    val batches =
+      Batch("AnalysisNodes", Once,
+        EliminateSubqueryAliases) ::
+      Batch("ConstantFolding", FixedPoint(4),
+        OptimizeIn,
+        ConstantFolding,
+        PruneFilters) :: Nil
+  }
+
+  test("SPARK-33544: Constant folding test CreateArray") {
+    val originalQuery =
+      testRelation
+        .select('a)
+        .where(Size(CreateArray(Seq('a))) > 0)
+
+    val optimized = OptimizeForCreate.execute(originalQuery.analyze)
+
+    val correctAnswer =
+      testRelation
+        .select('a)
+        .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("SPARK-37907: InvokeLike support ConstantFolding") {
+    val originalQuery =
+      testRelation
+        .select(
+          StaticInvoke(
+            classOf[ByteArray],
+            BinaryType,
+            "lpad",
+            Seq(Literal("Spark".getBytes), Literal(7), Literal("W".getBytes)),
+            Seq(BinaryType, IntegerType, BinaryType),
+            returnNullable = false).as("c1"),
+          Invoke(
+            Literal.create("a", StringType),
+            "substring",
+            StringType,
+            Seq(Literal(0), Literal(1))).as("c2"),
+          NewInstance(
+            cls = classOf[GenericArrayData],
+            arguments = Literal.fromObject(List(1, 2, 3)) :: Nil,
+            inputTypes = Nil,
+            propagateNull = false,
+            dataType = ArrayType(IntegerType),
+            outerPointer = None).as("c3"))
+
+    val optimized = Optimize.execute(originalQuery.analyze)
+
+    val correctAnswer =
+      testRelation
+        .select(
+          Literal("WWSpark".getBytes()).as("c1"),
+          Literal.create("a", StringType).as("c2"),
+          Literal.create(new GenericArrayData(List(1, 2, 3)), ArrayType(IntegerType)).as("c3"))
         .analyze
 
     comparePlans(optimized, correctAnswer)

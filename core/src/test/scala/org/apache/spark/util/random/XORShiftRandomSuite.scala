@@ -17,44 +17,38 @@
 
 package org.apache.spark.util.random
 
-import org.scalatest.Matchers
-
 import org.apache.commons.math3.stat.inference.ChiSquareTest
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.util.Utils.times
 
-import scala.language.reflectiveCalls
-
 class XORShiftRandomSuite extends SparkFunSuite with Matchers {
-
-  private def fixture = new {
-    val seed = 1L
-    val xorRand = new XORShiftRandom(seed)
-    val hundMil = 1e8.toInt
-  }
 
   /*
    * This test is based on a chi-squared test for randomness.
    */
   test ("XORShift generates valid random numbers") {
 
-    val f = fixture
+    val xorRand = new XORShiftRandom(1L)
 
     val numBins = 10 // create 10 bins
     val numRows = 5 // create 5 rows
     val bins = Array.ofDim[Long](numRows, numBins)
 
     // populate bins based on modulus of the random number for each row
-    for (r <- 0 to numRows-1) {
-      times(f.hundMil) {bins(r)(math.abs(f.xorRand.nextInt) % numBins) += 1}
+    for (r <- 0 until numRows) {
+      times(100000000) {
+        bins(r)(math.abs(xorRand.nextInt) % numBins) += 1
+      }
     }
 
     /*
      * Perform the chi square test on the 5 rows of randomly generated numbers evenly divided into
      * 10 bins. chiSquareTest returns true iff the null hypothesis (that the classifications
      * represented by the counts in the columns of the input 2-way table are independent of the
-     * rows) can be rejected with 100 * (1 - alpha) percent confidence, where alpha is prespeficied
+     * rows) can be rejected with 100 * (1 - alpha) percent confidence, where alpha is prespecified
      * as 0.05
      */
     val chiTest = new ChiSquareTest

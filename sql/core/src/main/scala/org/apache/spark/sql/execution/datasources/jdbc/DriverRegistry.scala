@@ -19,9 +19,10 @@ package org.apache.spark.sql.execution.datasources.jdbc
 
 import java.sql.{Driver, DriverManager}
 
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 
-import org.apache.spark.Logging
+import org.apache.spark.internal.Logging
 import org.apache.spark.util.Utils
 
 /**
@@ -31,6 +32,13 @@ import org.apache.spark.util.Utils
  * To solve the problem, drivers from user-supplied jars are wrapped into thin wrapper.
  */
 object DriverRegistry extends Logging {
+
+  /**
+   * Load DriverManager first to avoid any race condition between
+   * DriverManager static initialization block and specific driver class's
+   * static initialization block. e.g. PhoenixDriver
+   */
+  DriverManager.getDrivers
 
   private val wrapperMap: mutable.Map[String, DriverWrapper] = mutable.Map.empty
 
@@ -43,7 +51,7 @@ object DriverRegistry extends Logging {
     } else {
       synchronized {
         if (wrapperMap.get(className).isEmpty) {
-          val wrapper = new DriverWrapper(cls.newInstance().asInstanceOf[Driver])
+          val wrapper = new DriverWrapper(cls.getConstructor().newInstance().asInstanceOf[Driver])
           DriverManager.registerDriver(wrapper)
           wrapperMap(className) = wrapper
           logTrace(s"Wrapper for $className registered")
@@ -52,9 +60,14 @@ object DriverRegistry extends Logging {
     }
   }
 
-  def getDriverClassName(url: String): String = DriverManager.getDriver(url) match {
-    case wrapper: DriverWrapper => wrapper.wrapped.getClass.getCanonicalName
-    case driver => driver.getClass.getCanonicalName
+  def get(className: String): Driver = {
+    DriverManager.getDrivers.asScala.collectFirst {
+      case d: DriverWrapper if d.wrapped.getClass.getCanonicalName == className => d.wrapped
+      case d if d.getClass.getCanonicalName == className => d
+    }.getOrElse {
+      throw new IllegalStateException(
+        s"Did not find registered driver with class $className")
+    }
   }
 }
 

@@ -19,23 +19,20 @@ package org.apache.spark.mllib.fpm
 import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 
-import org.apache.spark.Logging
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.api.java.JavaSparkContext.fakeClassTag
+import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.fpm.AssociationRules.Rule
 import org.apache.spark.mllib.fpm.FPGrowth.FreqItemset
 import org.apache.spark.rdd.RDD
 
 /**
- * :: Experimental ::
- *
- * Generates association rules from a [[RDD[FreqItemset[Item]]]. This method only generates
+ * Generates association rules from a `RDD[FreqItemset[Item]]`. This method only generates
  * association rules which have a single item as the consequent.
  *
  */
 @Since("1.5.0")
-@Experimental
 class AssociationRules private[fpm] (
     private var minConfidence: Double) extends Logging with Serializable {
 
@@ -50,19 +47,33 @@ class AssociationRules private[fpm] (
    */
   @Since("1.5.0")
   def setMinConfidence(minConfidence: Double): this.type = {
-    require(minConfidence >= 0.0 && minConfidence <= 1.0)
+    require(minConfidence >= 0.0 && minConfidence <= 1.0,
+      s"Minimal confidence must be in range [0, 1] but got ${minConfidence}")
     this.minConfidence = minConfidence
     this
   }
 
   /**
-   * Computes the association rules with confidence above [[minConfidence]].
+   * Computes the association rules with confidence above `minConfidence`.
    * @param freqItemsets frequent itemset model obtained from [[FPGrowth]]
-   * @return a [[Set[Rule[Item]]] containing the assocation rules.
+   * @return a `RDD[Rule[Item]]` containing the association rules.
    *
    */
   @Since("1.5.0")
   def run[Item: ClassTag](freqItemsets: RDD[FreqItemset[Item]]): RDD[Rule[Item]] = {
+    run(freqItemsets, Map.empty[Item, Double])
+  }
+
+  /**
+   * Computes the association rules with confidence above `minConfidence`.
+   * @param freqItemsets frequent itemset model obtained from [[FPGrowth]]
+   * @param itemSupport map containing an item and its support
+   * @return a `RDD[Rule[Item]]` containing the association rules. The rules will be able to
+   *         compute also the lift metric.
+   */
+  @Since("2.4.0")
+  def run[Item: ClassTag](freqItemsets: RDD[FreqItemset[Item]],
+      itemSupport: scala.collection.Map[Item, Double]): RDD[Rule[Item]] = {
     // For candidate rule X => Y, generate (X, (Y, freq(X union Y)))
     val candidates = freqItemsets.flatMap { itemset =>
       val items = itemset.items
@@ -77,12 +88,19 @@ class AssociationRules private[fpm] (
 
     // Join to get (X, ((Y, freq(X union Y)), freq(X))), generate rules, and filter by confidence
     candidates.join(freqItemsets.map(x => (x.items.toSeq, x.freq)))
-      .map { case (antecendent, ((consequent, freqUnion), freqAntecedent)) =>
-      new Rule(antecendent.toArray, consequent.toArray, freqUnion, freqAntecedent)
-    }.filter(_.confidence >= minConfidence)
+      .map { case (antecedent, ((consequent, freqUnion), freqAntecedent)) =>
+        new Rule(antecedent.toArray,
+          consequent.toArray,
+          freqUnion,
+          freqAntecedent,
+          // the consequent contains always only one element
+          itemSupport.get(consequent.head))
+      }.filter(_.confidence >= minConfidence)
   }
 
-  /** Java-friendly version of [[run]]. */
+  /**
+   * Java-friendly version of `run`.
+   */
   @Since("1.5.0")
   def run[Item](freqItemsets: JavaRDD[FreqItemset[Item]]): JavaRDD[Rule[Item]] = {
     val tag = fakeClassTag[Item]
@@ -94,8 +112,6 @@ class AssociationRules private[fpm] (
 object AssociationRules {
 
   /**
-   * :: Experimental ::
-   *
    * An association rule between sets of items.
    * @param antecedent hypotheses of the rule. Java users should call [[Rule#javaAntecedent]]
    *                   instead.
@@ -105,19 +121,25 @@ object AssociationRules {
    *
    */
   @Since("1.5.0")
-  @Experimental
   class Rule[Item] private[fpm] (
       @Since("1.5.0") val antecedent: Array[Item],
       @Since("1.5.0") val consequent: Array[Item],
-      freqUnion: Double,
-      freqAntecedent: Double) extends Serializable {
+      private[spark] val freqUnion: Double,
+      freqAntecedent: Double,
+      freqConsequent: Option[Double]) extends Serializable {
 
     /**
      * Returns the confidence of the rule.
      *
      */
     @Since("1.5.0")
-    def confidence: Double = freqUnion.toDouble / freqAntecedent
+    def confidence: Double = freqUnion / freqAntecedent
+
+    /**
+     * Returns the lift of the rule.
+     */
+    @Since("2.4.0")
+    def lift: Option[Double] = freqConsequent.map(fCons => confidence / fCons)
 
     require(antecedent.toSet.intersect(consequent.toSet).isEmpty, {
       val sharedItems = antecedent.toSet.intersect(consequent.toSet)
@@ -145,7 +167,7 @@ object AssociationRules {
 
     override def toString: String = {
       s"${antecedent.mkString("{", ",", "}")} => " +
-        s"${consequent.mkString("{", ",", "}")}: ${confidence}"
+        s"${consequent.mkString("{", ",", "}")}: (confidence: $confidence; lift: $lift)"
     }
   }
 }

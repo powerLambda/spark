@@ -19,9 +19,11 @@ package org.apache.spark.deploy
 
 import java.net.{URI, URISyntaxException}
 
+import scala.annotation.tailrec
 import scala.collection.mutable.ListBuffer
 
-import org.apache.log4j.Level
+import org.apache.logging.log4j.Level
+
 import org.apache.spark.util.{IntParam, MemoryParam, Utils}
 
 /**
@@ -40,7 +42,7 @@ private[deploy] class ClientArguments(args: Array[String]) {
   var supervise: Boolean = DEFAULT_SUPERVISE
   var memory: Int = DEFAULT_MEMORY
   var cores: Int = DEFAULT_CORES
-  private var _driverOptions = ListBuffer[String]()
+  private val _driverOptions = ListBuffer[String]()
   def driverOptions: Seq[String] = _driverOptions.toSeq
 
   // kill parameters
@@ -48,6 +50,7 @@ private[deploy] class ClientArguments(args: Array[String]) {
 
   parse(args.toList)
 
+  @tailrec
   private def parse(args: List[String]): Unit = args match {
     case ("--cores" | "-c") :: IntParam(value) :: tail =>
       cores = value
@@ -97,7 +100,7 @@ private[deploy] class ClientArguments(args: Array[String]) {
   /**
    * Print usage and exit JVM with the given exit code.
    */
-  private def printUsageAndExit(exitCode: Int) {
+  private def printUsageAndExit(exitCode: Int): Unit = {
     // TODO: It wouldn't be too hard to allow users to submit their app and dependency jars
     //       separately similar to in the YARN client.
     val usage =

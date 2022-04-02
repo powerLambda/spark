@@ -18,16 +18,20 @@
 // scalastyle:off println
 package org.apache.spark.examples.mllib
 
+import java.util.Locale
+
+import org.apache.logging.log4j.Level
+import org.apache.logging.log4j.core.config.Configurator
 import scopt.OptionParser
 
-import org.apache.log4j.{Level, Logger}
+import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.ml.Pipeline
 import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel, RegexTokenizer, StopWordsRemover}
+import org.apache.spark.ml.linalg.{Vector => MLVector}
 import org.apache.spark.mllib.clustering.{DistributedLDAModel, EMLDAOptimizer, LDA, OnlineLDAOptimizer}
-import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{Row, SQLContext}
-import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.sql.{Row, SparkSession}
 
 /**
  * An example Latent Dirichlet Allocation (LDA) app. Run with
@@ -50,7 +54,7 @@ object LDAExample {
       checkpointDir: Option[String] = None,
       checkpointInterval: Int = 10) extends AbstractParams[Params]
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     val defaultParams = Params()
 
     val parser = new OptionParser[Params]("LDAExample") {
@@ -98,19 +102,17 @@ object LDAExample {
         .action((x, c) => c.copy(input = c.input :+ x))
     }
 
-    parser.parse(args, defaultParams).map { params =>
-      run(params)
-    }.getOrElse {
-      parser.showUsageAsError
-      sys.exit(1)
+    parser.parse(args, defaultParams) match {
+      case Some(params) => run(params)
+      case _ => sys.exit(1)
     }
   }
 
-  private def run(params: Params) {
+  private def run(params: Params): Unit = {
     val conf = new SparkConf().setAppName(s"LDAExample with $params")
     val sc = new SparkContext(conf)
 
-    Logger.getRootLogger.setLevel(Level.WARN)
+    Configurator.setRootLevel(Level.WARN)
 
     // Load documents, and prepare them for LDA.
     val preprocessStart = System.nanoTime()
@@ -118,7 +120,7 @@ object LDAExample {
       preprocess(sc, params.input, params.vocabSize, params.stopwordFile)
     corpus.cache()
     val actualCorpusSize = corpus.count()
-    val actualVocabSize = vocabArray.size
+    val actualVocabSize = vocabArray.length
     val preprocessElapsed = (System.nanoTime() - preprocessStart) / 1e9
 
     println()
@@ -132,7 +134,7 @@ object LDAExample {
     // Run LDA.
     val lda = new LDA()
 
-    val optimizer = params.algorithm.toLowerCase match {
+    val optimizer = params.algorithm.toLowerCase(Locale.ROOT) match {
       case "em" => new EMLDAOptimizer
       // add (1.0 / actualCorpusSize) to MiniBatchFraction be more robust on tiny datasets.
       case "online" => new OnlineLDAOptimizer().setMiniBatchFraction(0.05 + 1.0 / actualCorpusSize)
@@ -156,17 +158,18 @@ object LDAExample {
     println(s"Finished training LDA model.  Summary:")
     println(s"\t Training time: $elapsed sec")
 
-    if (ldaModel.isInstanceOf[DistributedLDAModel]) {
-      val distLDAModel = ldaModel.asInstanceOf[DistributedLDAModel]
-      val avgLogLikelihood = distLDAModel.logLikelihood / actualCorpusSize.toDouble
-      println(s"\t Training data average log likelihood: $avgLogLikelihood")
-      println()
+    ldaModel match {
+      case distLDAModel: DistributedLDAModel =>
+        val avgLogLikelihood = distLDAModel.logLikelihood / actualCorpusSize.toDouble
+        println(s"\t Training data average log likelihood: $avgLogLikelihood")
+        println()
+      case _ => // do nothing
     }
 
     // Print the topics, showing the top-weighted terms for each topic.
     val topicIndices = ldaModel.describeTopics(maxTermsPerTopic = 10)
     val topics = topicIndices.map { case (terms, termWeights) =>
-      terms.zip(termWeights).map { case (term, weight) => (vocabArray(term.toInt), weight) }
+      terms.zip(termWeights).map { case (term, weight) => (vocabArray(term), weight) }
     }
     println(s"${params.k} topics:")
     topics.zipWithIndex.foreach { case (topic, i) =>
@@ -189,8 +192,11 @@ object LDAExample {
       vocabSize: Int,
       stopwordFile: String): (RDD[(Long, Vector)], Array[String], Long) = {
 
-    val sqlContext = SQLContext.getOrCreate(sc)
-    import sqlContext.implicits._
+    val spark = SparkSession
+      .builder
+      .sparkContext(sc)
+      .getOrCreate()
+    import spark.implicits._
 
     // Get dataset of document texts
     // One document per line in each text file. If the input consists of many small files,
@@ -221,7 +227,8 @@ object LDAExample {
     val model = pipeline.fit(df)
     val documents = model.transform(df)
       .select("features")
-      .map { case Row(features: Vector) => features }
+      .rdd
+      .map { case Row(features: MLVector) => Vectors.fromML(features) }
       .zipWithIndex()
       .map(_.swap)
 

@@ -19,14 +19,16 @@ package org.apache.spark.sql.execution.aggregate
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction}
-import org.apache.spark.sql.execution.metric.LongSQLMetric
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.execution.metric.SQLMetric
 
 /**
- * An iterator used to evaluate [[AggregateFunction]]. It assumes the input rows have been
- * sorted by values of [[groupingExpressions]].
+ * An iterator used to evaluate
+ * [[org.apache.spark.sql.catalyst.expressions.aggregate.AggregateFunction]].
+ * It assumes the input rows have been sorted by values of [[groupingExpressions]].
  */
 class SortBasedAggregationIterator(
+    partIndex: Int,
     groupingExpressions: Seq[NamedExpression],
     valueAttributes: Seq[Attribute],
     inputIterator: Iterator[InternalRow],
@@ -34,10 +36,10 @@ class SortBasedAggregationIterator(
     aggregateAttributes: Seq[Attribute],
     initialInputBufferOffset: Int,
     resultExpressions: Seq[NamedExpression],
-    newMutableProjection: (Seq[Expression], Seq[Attribute]) => (() => MutableProjection),
-    numInputRows: LongSQLMetric,
-    numOutputRows: LongSQLMetric)
+    newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection,
+    numOutputRows: SQLMetric)
   extends AggregationIterator(
+    partIndex,
     groupingExpressions,
     valueAttributes,
     aggregateExpressions,
@@ -47,14 +49,14 @@ class SortBasedAggregationIterator(
     newMutableProjection) {
 
   /**
-    * Creates a new aggregation buffer and initializes buffer values
-    * for all aggregate functions.
-    */
-  private def newBuffer: MutableRow = {
+   * Creates a new aggregation buffer and initializes buffer values
+   * for all aggregate functions.
+   */
+  private def newBuffer: InternalRow = {
     val bufferSchema = aggregateFunctions.flatMap(_.aggBufferAttributes)
     val bufferRowSize: Int = bufferSchema.length
 
-    val genericMutableBuffer = new GenericMutableRow(bufferRowSize)
+    val genericMutableBuffer = new GenericInternalRow(bufferRowSize)
     val useUnsafeBuffer = bufferSchema.map(_.dataType).forall(UnsafeRow.isMutable)
 
     val buffer = if (useUnsafeBuffer) {
@@ -85,7 +87,7 @@ class SortBasedAggregationIterator(
   private[this] var sortedInputHasNewGroup: Boolean = false
 
   // The aggregation buffer used by the sort-based aggregation.
-  private[this] val sortBasedAggregationBuffer: MutableRow = newBuffer
+  private[this] val sortBasedAggregationBuffer: InternalRow = newBuffer
 
   protected def initialize(): Unit = {
     if (inputIterator.hasNext) {
@@ -93,7 +95,6 @@ class SortBasedAggregationIterator(
       val inputRow = inputIterator.next()
       nextGroupingKey = groupingProjection(inputRow).copy()
       firstRowInNextGroup = inputRow.copy()
-      numInputRows += 1
       sortedInputHasNewGroup = true
     } else {
       // This inputIter is empty.
@@ -118,7 +119,6 @@ class SortBasedAggregationIterator(
       // Get the grouping key.
       val currentRow = inputIterator.next()
       val groupingKey = groupingProjection(currentRow)
-      numInputRows += 1
 
       // Check if the current row belongs the current input row.
       if (currentGroupingKey == groupingKey) {

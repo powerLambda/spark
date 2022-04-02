@@ -19,15 +19,14 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.types.AbstractDataType
-import org.apache.spark.sql.catalyst.analysis.HiveTypeCoercion.ImplicitTypeCasts
 
 /**
- * An trait that gets mixin to define the expected input types of an expression.
+ * A trait that gets mixin to define the expected input types of an expression.
  *
  * This trait is typically used by operator expressions (e.g. [[Add]], [[Subtract]]) to define
  * expected input types without any implicit casting.
  *
- * Most function expressions (e.g. [[Substring]] should extends [[ImplicitCastInputTypes]]) instead.
+ * Most function expressions (e.g. [[Substring]] should extend [[ImplicitCastInputTypes]]) instead.
  */
 trait ExpectsInputTypes extends Expression {
 
@@ -42,10 +41,19 @@ trait ExpectsInputTypes extends Expression {
   def inputTypes: Seq[AbstractDataType]
 
   override def checkInputDataTypes(): TypeCheckResult = {
-    val mismatches = children.zip(inputTypes).zipWithIndex.collect {
-      case ((child, expected), idx) if !expected.acceptsType(child.dataType) =>
+    ExpectsInputTypes.checkInputDataTypes(children, inputTypes)
+  }
+}
+
+object ExpectsInputTypes {
+
+  def checkInputDataTypes(
+      inputs: Seq[Expression],
+      inputTypes: Seq[AbstractDataType]): TypeCheckResult = {
+    val mismatches = inputs.zip(inputTypes).zipWithIndex.collect {
+      case ((input, expected), idx) if !expected.acceptsType(input.dataType) =>
         s"argument ${idx + 1} requires ${expected.simpleString} type, " +
-          s"however, '${child.prettyString}' is of ${child.dataType.simpleString} type."
+          s"however, '${input.sql}' is of ${input.dataType.catalogString} type."
     }
 
     if (mismatches.isEmpty) {
@@ -56,9 +64,9 @@ trait ExpectsInputTypes extends Expression {
   }
 }
 
-
 /**
- * A mixin for the analyzer to perform implicit type casting using [[ImplicitTypeCasts]].
+ * A mixin for the analyzer to perform implicit type casting using
+ * [[org.apache.spark.sql.catalyst.analysis.TypeCoercion.ImplicitTypeCasts]].
  */
 trait ImplicitCastInputTypes extends ExpectsInputTypes {
   // No other methods

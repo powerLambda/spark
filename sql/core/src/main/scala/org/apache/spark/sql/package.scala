@@ -17,8 +17,8 @@
 
 package org.apache.spark
 
-import org.apache.spark.annotation.DeveloperApi
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.annotation.{DeveloperApi, Unstable}
+import org.apache.spark.sql.execution.SparkStrategy
 
 /**
  * Allows the execution of relational queries, including those expressed in SQL using Spark.
@@ -40,12 +40,37 @@ package object sql {
    * [[org.apache.spark.sql.sources]]
    */
   @DeveloperApi
-  type Strategy = org.apache.spark.sql.catalyst.planning.GenericStrategy[SparkPlan]
+  @Unstable
+  type Strategy = SparkStrategy
+
+  type DataFrame = Dataset[Row]
 
   /**
-   * Type alias for [[DataFrame]]. Kept here for backward source compatibility for Scala.
-   * @deprecated As of 1.3.0, replaced by `DataFrame`.
+   * Metadata key which is used to write Spark version in the followings:
+   * - Parquet file metadata
+   * - ORC file metadata
+   * - Avro file metadata
+   *
+   * Note that Hive table property `spark.sql.create.version` also has Spark version.
    */
-  @deprecated("use DataFrame", "1.3.0")
-  type SchemaRDD = DataFrame
+  private[sql] val SPARK_VERSION_METADATA_KEY = "org.apache.spark.version"
+
+  /**
+   * The metadata key which is used to write the current session time zone into:
+   * - Parquet file metadata
+   * - Avro file metadata
+   */
+  private[sql] val SPARK_TIMEZONE_METADATA_KEY = "org.apache.spark.timeZone"
+
+  /**
+   * Parquet/Avro file metadata key to indicate that the file was written with legacy datetime
+   * values.
+   */
+  private[sql] val SPARK_LEGACY_DATETIME_METADATA_KEY = "org.apache.spark.legacyDateTime"
+
+  /**
+   * Parquet file metadata key to indicate that the file with INT96 column type was written
+   * with rebasing.
+   */
+  private[sql] val SPARK_LEGACY_INT96_METADATA_KEY = "org.apache.spark.legacyINT96"
 }

@@ -17,9 +17,10 @@
 
 package org.apache.spark.scheduler
 
-import scala.collection.mutable.ListBuffer
-
+import org.apache.spark.TaskState
+import org.apache.spark.TaskState.TaskState
 import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.errors.SparkCoreErrors
 
 /**
  * :: DeveloperApi ::
@@ -28,13 +29,39 @@ import org.apache.spark.annotation.DeveloperApi
 @DeveloperApi
 class TaskInfo(
     val taskId: Long,
+    /**
+     * The index of this task within its task set. Not necessarily the same as the ID of the RDD
+     * partition that the task is computing.
+     */
     val index: Int,
     val attemptNumber: Int,
+    /**
+     * The actual RDD partition ID in this task.
+     * The ID of the RDD partition is always same across task attempts.
+     * This will be -1 for historical data, and available for all applications since Spark 3.3.
+     */
+    val partitionId: Int,
     val launchTime: Long,
     val executorId: String,
     val host: String,
     val taskLocality: TaskLocality.TaskLocality,
     val speculative: Boolean) {
+
+  /**
+   * This api doesn't contains partitionId, please use the new api.
+   * Remain it for backward compatibility before Spark 3.3.
+   */
+  def this(
+      taskId: Long,
+      index: Int,
+      attemptNumber: Int,
+      launchTime: Long,
+      executorId: String,
+      host: String,
+      taskLocality: TaskLocality.TaskLocality,
+      speculative: Boolean) = {
+    this(taskId, index, attemptNumber, -1, launchTime, executorId, host, taskLocality, speculative)
+  }
 
   /**
    * The time when the task started remotely getting the result. Will not be set if the
@@ -48,7 +75,13 @@ class TaskInfo(
    * accumulable to be updated multiple times in a single task or for two accumulables with the
    * same name but different IDs to exist in a task.
    */
-  val accumulables = ListBuffer[AccumulableInfo]()
+  def accumulables: Seq[AccumulableInfo] = _accumulables
+
+  private[this] var _accumulables: Seq[AccumulableInfo] = Nil
+
+  private[spark] def setAccumulables(newAccumulables: Seq[AccumulableInfo]): Unit = {
+    _accumulables = newAccumulables
+  }
 
   /**
    * The time when the task has completed successfully (including the time to remotely fetch
@@ -58,24 +91,28 @@ class TaskInfo(
 
   var failed = false
 
-  private[spark] def markGettingResult(time: Long = System.currentTimeMillis) {
+  var killed = false
+
+  private[spark] def markGettingResult(time: Long): Unit = {
     gettingResultTime = time
   }
 
-  private[spark] def markSuccessful(time: Long = System.currentTimeMillis) {
+  private[spark] def markFinished(state: TaskState, time: Long): Unit = {
+    // finishTime should be set larger than 0, otherwise "finished" below will return false.
+    assert(time > 0)
     finishTime = time
-  }
-
-  private[spark] def markFailed(time: Long = System.currentTimeMillis) {
-    finishTime = time
-    failed = true
+    if (state == TaskState.FAILED) {
+      failed = true
+    } else if (state == TaskState.KILLED) {
+      killed = true
+    }
   }
 
   def gettingResult: Boolean = gettingResultTime != 0
 
   def finished: Boolean = finishTime != 0
 
-  def successful: Boolean = finished && !failed
+  def successful: Boolean = finished && !failed && !killed
 
   def running: Boolean = !finished
 
@@ -88,6 +125,8 @@ class TaskInfo(
       }
     } else if (failed) {
       "FAILED"
+    } else if (killed) {
+      "KILLED"
     } else if (successful) {
       "SUCCESS"
     } else {
@@ -95,14 +134,11 @@ class TaskInfo(
     }
   }
 
-  @deprecated("Use attemptNumber", "1.6.0")
-  def attempt: Int = attemptNumber
-
   def id: String = s"$index.$attemptNumber"
 
   def duration: Long = {
     if (!finished) {
-      throw new UnsupportedOperationException("duration() called on unfinished task")
+      throw SparkCoreErrors.durationCalledOnUnfinishedTaskError()
     } else {
       finishTime - launchTime
     }

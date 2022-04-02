@@ -19,28 +19,17 @@
 
 # Start all spark daemons.
 # Starts the master on this node.
-# Starts a worker on each node specified in conf/slaves
+# Starts a worker on each node specified in conf/workers
 
 if [ -z "${SPARK_HOME}" ]; then
   export SPARK_HOME="$(cd "`dirname "$0"`"/..; pwd)"
 fi
 
-TACHYON_STR=""
-
-while (( "$#" )); do
-case $1 in
-    --with-tachyon)
-      TACHYON_STR="--with-tachyon"
-      ;;
-  esac
-shift
-done
-
 # Load the Spark configuration
 . "${SPARK_HOME}/sbin/spark-config.sh"
 
 # Start Master
-"${SPARK_HOME}/sbin"/start-master.sh $TACHYON_STR
+"${SPARK_HOME}/sbin"/start-master.sh
 
 # Start Workers
-"${SPARK_HOME}/sbin"/start-slaves.sh $TACHYON_STR
+"${SPARK_HOME}/sbin"/start-workers.sh

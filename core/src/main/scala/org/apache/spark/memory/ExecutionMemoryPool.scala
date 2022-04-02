@@ -21,10 +21,10 @@ import javax.annotation.concurrent.GuardedBy
 
 import scala.collection.mutable
 
-import org.apache.spark.Logging
+import org.apache.spark.internal.Logging
 
 /**
- * Implements policies and bookkeeping for sharing a adjustable-sized pool of memory between tasks.
+ * Implements policies and bookkeeping for sharing an adjustable-sized pool of memory between tasks.
  *
  * Tries to ensure that each task gets a reasonable share of memory, instead of some task ramping up
  * to a large amount first and then causing others to spill to disk repeatedly.
@@ -37,12 +37,17 @@ import org.apache.spark.Logging
  * tasks was performed by the ShuffleMemoryManager.
  *
  * @param lock a [[MemoryManager]] instance to synchronize on
- * @param poolName a human-readable name for this pool, for use in log messages
+ * @param memoryMode the type of memory tracked by this pool (on- or off-heap)
  */
 private[memory] class ExecutionMemoryPool(
     lock: Object,
-    poolName: String
+    memoryMode: MemoryMode
   ) extends MemoryPool(lock) with Logging {
+
+  private[this] val poolName: String = memoryMode match {
+    case MemoryMode.ON_HEAP => "on-heap execution"
+    case MemoryMode.OFF_HEAP => "off-heap execution"
+  }
 
   /**
    * Map from taskAttemptId -> memory consumption in bytes
@@ -86,7 +91,7 @@ private[memory] class ExecutionMemoryPool(
   private[memory] def acquireMemory(
       numBytes: Long,
       taskAttemptId: Long,
-      maybeGrowPool: Long => Unit = (additionalSpaceNeeded: Long) => Unit,
+      maybeGrowPool: Long => Unit = (additionalSpaceNeeded: Long) => (),
       computeMaxPoolSize: () => Long = () => poolSize): Long = lock.synchronized {
     assert(numBytes > 0, s"invalid number of bytes requested: $numBytes")
 
@@ -146,7 +151,7 @@ private[memory] class ExecutionMemoryPool(
    */
   def releaseMemory(numBytes: Long, taskAttemptId: Long): Unit = lock.synchronized {
     val curMem = memoryForTask.getOrElse(taskAttemptId, 0L)
-    var memoryToFree = if (curMem < numBytes) {
+    val memoryToFree = if (curMem < numBytes) {
       logWarning(
         s"Internal error: release called on $numBytes bytes but task only has $curMem bytes " +
           s"of memory from the $poolName pool")

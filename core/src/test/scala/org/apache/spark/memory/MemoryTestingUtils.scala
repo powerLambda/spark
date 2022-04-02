@@ -17,7 +17,9 @@
 
 package org.apache.spark.memory
 
-import org.apache.spark.{SparkEnv, TaskContextImpl, TaskContext}
+import java.util.Properties
+
+import org.apache.spark.{SparkEnv, TaskContext, TaskContextImpl}
 
 /**
  * Helper methods for mocking out memory-management-related classes in tests.
@@ -27,11 +29,13 @@ object MemoryTestingUtils {
     val taskMemoryManager = new TaskMemoryManager(env.memoryManager, 0)
     new TaskContextImpl(
       stageId = 0,
+      stageAttemptNumber = 0,
       partitionId = 0,
       taskAttemptId = 0,
       attemptNumber = 0,
+      numPartitions = 1,
       taskMemoryManager = taskMemoryManager,
-      metricsSystem = env.metricsSystem,
-      internalAccumulators = Seq.empty)
+      localProperties = new Properties,
+      metricsSystem = env.metricsSystem)
   }
 }

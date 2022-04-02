@@ -18,11 +18,11 @@
 package org.apache.spark.examples.mllib
 
 // scalastyle:off println
+import org.apache.spark.{SparkConf, SparkContext}
 // $example on$
 import org.apache.spark.mllib.clustering.BisectingKMeans
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
 // $example off$
-import org.apache.spark.{SparkConf, SparkContext}
 
 /**
  * An example demonstrating a bisecting k-means clustering in spark.mllib.
@@ -34,7 +34,7 @@ import org.apache.spark.{SparkConf, SparkContext}
  */
 object BisectingKMeansExample {
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     val sparkConf = new SparkConf().setAppName("mllib.BisectingKMeansExample")
     val sc = new SparkContext(sparkConf)
 

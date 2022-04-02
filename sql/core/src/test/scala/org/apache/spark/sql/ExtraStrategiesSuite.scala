@@ -20,20 +20,21 @@ package org.apache.spark.sql
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.logical.{Project, LogicalPlan}
-import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project}
+import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
+import org.apache.spark.sql.test.SharedSparkSession
 
-case class FastOperator(output: Seq[Attribute]) extends SparkPlan {
+case class FastOperator(output: Seq[Attribute]) extends LeafExecNode {
 
   override protected def doExecute(): RDD[InternalRow] = {
     val str = Literal("so fast").value
     val row = new GenericInternalRow(Array[Any](str))
-    sparkContext.parallelize(Seq(row))
+    val unsafeProj = UnsafeProjection.create(schema)
+    val unsafeRow = unsafeProj(row).copy()
+    sparkContext.parallelize(Seq(unsafeRow))
   }
 
   override def producedAttributes: AttributeSet = outputSet
-  override def children: Seq[SparkPlan] = Nil
 }
 
 object TestStrategy extends Strategy {
@@ -44,12 +45,12 @@ object TestStrategy extends Strategy {
   }
 }
 
-class ExtraStrategiesSuite extends QueryTest with SharedSQLContext {
+class ExtraStrategiesSuite extends QueryTest with SharedSparkSession {
   import testImplicits._
 
   test("insert an extraStrategy") {
     try {
-      sqlContext.experimental.extraStrategies = TestStrategy :: Nil
+      spark.experimental.extraStrategies = TestStrategy :: Nil
 
       val df = sparkContext.parallelize(Seq(("so slow", 1))).toDF("a", "b")
       checkAnswer(
@@ -60,7 +61,7 @@ class ExtraStrategiesSuite extends QueryTest with SharedSQLContext {
         df.select("a", "b"),
         Row("so slow", 1))
     } finally {
-      sqlContext.experimental.extraStrategies = Nil
+      spark.experimental.extraStrategies = Nil
     }
   }
 }

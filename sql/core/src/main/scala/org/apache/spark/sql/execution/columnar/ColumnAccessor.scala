@@ -19,24 +19,30 @@ package org.apache.spark.sql.execution.columnar
 
 import java.nio.{ByteBuffer, ByteOrder}
 
-import org.apache.spark.sql.catalyst.expressions.{MutableRow, UnsafeArrayData, UnsafeMapData, UnsafeRow}
+import scala.annotation.tailrec
+
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{UnsafeArrayData, UnsafeMapData, UnsafeRow}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.columnar.compression.CompressibleColumnAccessor
+import org.apache.spark.sql.execution.vectorized.WritableColumnVector
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.CalendarInterval
 
 /**
  * An `Iterator` like trait used to extract values from columnar byte buffer. When a value is
  * extracted from the buffer, instead of directly returning it, the value is set into some field of
- * a [[MutableRow]]. In this way, boxing cost can be avoided by leveraging the setter methods
- * for primitive values provided by [[MutableRow]].
+ * a [[InternalRow]]. In this way, boxing cost can be avoided by leveraging the setter methods
+ * for primitive values provided by [[InternalRow]].
  */
 private[columnar] trait ColumnAccessor {
   initialize()
 
-  protected def initialize()
+  protected def initialize(): Unit
 
   def hasNext: Boolean
 
-  def extractTo(row: MutableRow, ordinal: Int)
+  def extractTo(row: InternalRow, ordinal: Int): Unit
 
   protected def underlyingBuffer: ByteBuffer
 }
@@ -46,15 +52,15 @@ private[columnar] abstract class BasicColumnAccessor[JvmType](
     protected val columnType: ColumnType[JvmType])
   extends ColumnAccessor {
 
-  protected def initialize() {}
+  protected def initialize(): Unit = {}
 
   override def hasNext: Boolean = buffer.hasRemaining
 
-  override def extractTo(row: MutableRow, ordinal: Int): Unit = {
+  override def extractTo(row: InternalRow, ordinal: Int): Unit = {
     extractSingle(row, ordinal)
   }
 
-  def extractSingle(row: MutableRow, ordinal: Int): Unit = {
+  def extractSingle(row: InternalRow, ordinal: Int): Unit = {
     columnType.extract(buffer, row, ordinal)
   }
 
@@ -100,6 +106,10 @@ private[columnar] class BinaryColumnAccessor(buffer: ByteBuffer)
   extends BasicColumnAccessor[Array[Byte]](buffer, BINARY)
   with NullableColumnAccessor
 
+private[columnar] class IntervalColumnAccessor(buffer: ByteBuffer)
+  extends BasicColumnAccessor[CalendarInterval](buffer, CALENDAR_INTERVAL)
+  with NullableColumnAccessor
+
 private[columnar] class CompactDecimalColumnAccessor(buffer: ByteBuffer, dataType: DecimalType)
   extends NativeColumnAccessor(buffer, COMPACT_DECIMAL(dataType))
 
@@ -119,7 +129,8 @@ private[columnar] class MapColumnAccessor(buffer: ByteBuffer, dataType: MapType)
   extends BasicColumnAccessor[UnsafeMapData](buffer, MAP(dataType))
   with NullableColumnAccessor
 
-private[columnar] object ColumnAccessor {
+private[sql] object ColumnAccessor {
+  @tailrec
   def apply(dataType: DataType, buffer: ByteBuffer): ColumnAccessor = {
     val buf = buffer.order(ByteOrder.nativeOrder)
 
@@ -128,8 +139,8 @@ private[columnar] object ColumnAccessor {
       case BooleanType => new BooleanColumnAccessor(buf)
       case ByteType => new ByteColumnAccessor(buf)
       case ShortType => new ShortColumnAccessor(buf)
-      case IntegerType | DateType => new IntColumnAccessor(buf)
-      case LongType | TimestampType => new LongColumnAccessor(buf)
+      case IntegerType | DateType | _: YearMonthIntervalType => new IntColumnAccessor(buf)
+      case LongType | TimestampType | _: DayTimeIntervalType => new LongColumnAccessor(buf)
       case FloatType => new FloatColumnAccessor(buf)
       case DoubleType => new DoubleColumnAccessor(buf)
       case StringType => new StringColumnAccessor(buf)
@@ -141,8 +152,25 @@ private[columnar] object ColumnAccessor {
       case array: ArrayType => new ArrayColumnAccessor(buf, array)
       case map: MapType => new MapColumnAccessor(buf, map)
       case udt: UserDefinedType[_] => ColumnAccessor(udt.sqlType, buffer)
-      case other =>
-        throw new Exception(s"not support type: $other")
+      case other => throw QueryExecutionErrors.notSupportTypeError(other)
     }
+  }
+
+  def decompress(columnAccessor: ColumnAccessor, columnVector: WritableColumnVector, numRows: Int):
+      Unit = {
+    columnAccessor match {
+      case nativeAccessor: NativeColumnAccessor[_] =>
+        nativeAccessor.decompress(columnVector, numRows)
+      case _ =>
+        throw QueryExecutionErrors.notSupportNonPrimitiveTypeError()
+    }
+  }
+
+  def decompress(
+      array: Array[Byte], columnVector: WritableColumnVector, dataType: DataType, numRows: Int):
+      Unit = {
+    val byteBuffer = ByteBuffer.wrap(array)
+    val columnAccessor = ColumnAccessor(dataType, byteBuffer)
+    decompress(columnAccessor, columnVector, numRows)
   }
 }

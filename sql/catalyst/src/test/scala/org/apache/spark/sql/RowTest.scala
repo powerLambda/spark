@@ -17,12 +17,15 @@
 
 package org.apache.spark.sql
 
+import org.scalatest.funspec.AnyFunSpec
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
+
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{GenericRow, GenericRowWithSchema}
 import org.apache.spark.sql.types._
-import org.scalatest.{Matchers, FunSpec}
 
-class RowTest extends FunSpec with Matchers {
+class RowTest extends AnyFunSpec with Matchers {
 
   val schema = StructType(
     StructField("col1", StringType) ::
@@ -85,7 +88,7 @@ class RowTest extends FunSpec with Matchers {
       }
     }
 
-    it("getAs() on type extending AnyVal does not throw exception when value is null"){
+    it("getAs() on type extending AnyVal does not throw exception when value is null") {
       sampleRowWithoutCol3.getAs[String](sampleRowWithoutCol3.fieldIndex("col1")) shouldBe null
     }
   }
@@ -102,6 +105,32 @@ class RowTest extends FunSpec with Matchers {
 
     it("equality check for internal rows") {
       internalRow shouldEqual internalRow2
+    }
+  }
+
+  describe("row immutability") {
+    val values = Seq(1, 2, "3", "IV", 6L)
+    val externalRow = Row.fromSeq(values)
+    val internalRow = InternalRow.fromSeq(values)
+
+    def modifyValues(values: Seq[Any]): Seq[Any] = {
+      val array = values.toArray
+      array(2) = "42"
+      array
+    }
+
+    it("copy should return same ref for external rows") {
+      externalRow should be theSameInstanceAs externalRow.copy()
+    }
+
+    it("toSeq should not expose internal state for external rows") {
+      val modifiedValues = modifyValues(externalRow.toSeq)
+      externalRow.toSeq should not equal modifiedValues
+    }
+
+    it("toSeq should not expose internal state for internal rows") {
+      val modifiedValues = modifyValues(internalRow.toSeq(Seq.empty))
+      internalRow.toSeq(Seq.empty) should not equal modifiedValues
     }
   }
 }

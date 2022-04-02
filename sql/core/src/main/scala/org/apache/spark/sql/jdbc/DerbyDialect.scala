@@ -18,13 +18,38 @@
 package org.apache.spark.sql.jdbc
 
 import java.sql.Types
+import java.util.Locale
 
+import org.apache.spark.sql.connector.expressions.aggregate.{AggregateFunc, GeneralAggregateFunc}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
 
 
 private object DerbyDialect extends JdbcDialect {
 
-  override def canHandle(url: String): Boolean = url.startsWith("jdbc:derby")
+  override def canHandle(url: String): Boolean =
+    url.toLowerCase(Locale.ROOT).startsWith("jdbc:derby")
+
+  // See https://db.apache.org/derby/docs/10.15/ref/index.html
+  override def compileAggregate(aggFunction: AggregateFunc): Option[String] = {
+    super.compileAggregate(aggFunction).orElse(
+      aggFunction match {
+        case f: GeneralAggregateFunc if f.name() == "VAR_POP" && f.isDistinct == false =>
+          assert(f.children().length == 1)
+          Some(s"VAR_POP(${f.children().head})")
+        case f: GeneralAggregateFunc if f.name() == "VAR_SAMP" && f.isDistinct == false =>
+          assert(f.children().length == 1)
+          Some(s"VAR_SAMP(${f.children().head})")
+        case f: GeneralAggregateFunc if f.name() == "STDDEV_POP" && f.isDistinct == false =>
+          assert(f.children().length == 1)
+          Some(s"STDDEV_POP(${f.children().head})")
+        case f: GeneralAggregateFunc if f.name() == "STDDEV_SAMP" && f.isDistinct == false =>
+          assert(f.children().length == 1)
+          Some(s"STDDEV_SAMP(${f.children().head})")
+        case _ => None
+      }
+    )
+  }
 
   override def getCatalystType(
       sqlType: Int, typeName: String, size: Int, md: MetadataBuilder): Option[DataType] = {
@@ -40,5 +65,22 @@ private object DerbyDialect extends JdbcDialect {
     case t: DecimalType if t.precision > 31 =>
       Option(JdbcType("DECIMAL(31,5)", java.sql.Types.DECIMAL))
     case _ => None
+  }
+
+  override def isCascadingTruncateTable(): Option[Boolean] = Some(false)
+
+  // See https://db.apache.org/derby/docs/10.15/ref/rrefsqljrenametablestatement.html
+  override def renameTable(oldTable: String, newTable: String): String = {
+    s"RENAME TABLE $oldTable TO $newTable"
+  }
+
+  // Derby currently doesn't support comment on table. Here is the ticket to add the support
+  // https://issues.apache.org/jira/browse/DERBY-7008
+  override def getTableCommentQuery(table: String, comment: String): String = {
+    throw QueryExecutionErrors.commentOnTableUnsupportedError()
+  }
+
+  override def getLimitClause(limit: Integer): String = {
+    ""
   }
 }

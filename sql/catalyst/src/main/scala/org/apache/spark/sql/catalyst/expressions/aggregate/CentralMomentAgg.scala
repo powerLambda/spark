@@ -17,10 +17,11 @@
 
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
-import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
+import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.util.TypeUtils
+import org.apache.spark.sql.catalyst.trees.UnaryLike
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 /**
@@ -39,191 +40,288 @@ import org.apache.spark.sql.types._
  *  - Xiangrui Meng.  "Simpler Online Updates for Arbitrary-Order Central Moments."
  *      2015. http://arxiv.org/abs/1510.04923
  *
- * @see [[https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
- *     Algorithms for calculating variance (Wikipedia)]]
+ * @see <a href="https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance">
+ * Algorithms for calculating variance (Wikipedia)</a>
  *
  * @param child to compute central moments of.
  */
-abstract class CentralMomentAgg(child: Expression) extends ImperativeAggregate with Serializable {
+abstract class CentralMomentAgg(child: Expression, nullOnDivideByZero: Boolean)
+  extends DeclarativeAggregate with ImplicitCastInputTypes with UnaryLike[Expression] {
 
   /**
    * The central moment order to be computed.
    */
   protected def momentOrder: Int
 
-  override def children: Seq[Expression] = Seq(child)
-
   override def nullable: Boolean = true
-
   override def dataType: DataType = DoubleType
+  override def inputTypes: Seq[AbstractDataType] = Seq(DoubleType)
 
-  override def inputTypes: Seq[AbstractDataType] = Seq(NumericType)
+  protected val n = AttributeReference("n", DoubleType, nullable = false)()
+  protected val avg = AttributeReference("avg", DoubleType, nullable = false)()
+  protected val m2 = AttributeReference("m2", DoubleType, nullable = false)()
+  protected val m3 = AttributeReference("m3", DoubleType, nullable = false)()
+  protected val m4 = AttributeReference("m4", DoubleType, nullable = false)()
 
-  override def checkInputDataTypes(): TypeCheckResult =
-    TypeUtils.checkForNumericExpr(child.dataType, s"function $prettyName")
-
-  override def aggBufferSchema: StructType = StructType.fromAttributes(aggBufferAttributes)
-
-  /**
-   * Size of aggregation buffer.
-   */
-  private[this] val bufferSize = 5
-
-  override val aggBufferAttributes: Seq[AttributeReference] = Seq.tabulate(bufferSize) { i =>
-    AttributeReference(s"M$i", DoubleType)()
+  protected def divideByZeroEvalResult: Expression = {
+    if (nullOnDivideByZero) Literal.create(null, DoubleType) else Double.NaN
   }
 
-  // Note: although this simply copies aggBufferAttributes, this common code can not be placed
-  // in the superclass because that will lead to initialization ordering issues.
-  override val inputAggBufferAttributes: Seq[AttributeReference] =
-    aggBufferAttributes.map(_.newInstance())
+  override def stringArgs: Iterator[Any] =
+    super.stringArgs.filter(_.isInstanceOf[Expression])
 
-  // buffer offsets
-  private[this] val nOffset = mutableAggBufferOffset
-  private[this] val meanOffset = mutableAggBufferOffset + 1
-  private[this] val secondMomentOffset = mutableAggBufferOffset + 2
-  private[this] val thirdMomentOffset = mutableAggBufferOffset + 3
-  private[this] val fourthMomentOffset = mutableAggBufferOffset + 4
+  private def trimHigherOrder[T](expressions: Seq[T]) = expressions.take(momentOrder + 1)
 
-  // frequently used values for online updates
-  private[this] var delta = 0.0
-  private[this] var deltaN = 0.0
-  private[this] var delta2 = 0.0
-  private[this] var deltaN2 = 0.0
-  private[this] var n = 0.0
-  private[this] var mean = 0.0
-  private[this] var m2 = 0.0
-  private[this] var m3 = 0.0
-  private[this] var m4 = 0.0
+  override val aggBufferAttributes = trimHigherOrder(Seq(n, avg, m2, m3, m4))
 
-  /**
-   * Initialize all moments to zero.
-   */
-  override def initialize(buffer: MutableRow): Unit = {
-    for (aggIndex <- 0 until bufferSize) {
-      buffer.setDouble(mutableAggBufferOffset + aggIndex, 0.0)
-    }
-  }
+  override val initialValues: Seq[Expression] = Array.fill(momentOrder + 1)(Literal(0.0))
 
-  /**
-   * Update the central moments buffer.
-   */
-  override def update(buffer: MutableRow, input: InternalRow): Unit = {
-    val v = Cast(child, DoubleType).eval(input)
-    if (v != null) {
-      val updateValue = v match {
-        case d: Double => d
-      }
+  override lazy val updateExpressions: Seq[Expression] = updateExpressionsDef
 
-      n = buffer.getDouble(nOffset)
-      mean = buffer.getDouble(meanOffset)
+  override val mergeExpressions: Seq[Expression] = {
 
-      n += 1.0
-      buffer.setDouble(nOffset, n)
-      delta = updateValue - mean
-      deltaN = delta / n
-      mean += deltaN
-      buffer.setDouble(meanOffset, mean)
-
-      if (momentOrder >= 2) {
-        m2 = buffer.getDouble(secondMomentOffset)
-        m2 += delta * (delta - deltaN)
-        buffer.setDouble(secondMomentOffset, m2)
-      }
-
-      if (momentOrder >= 3) {
-        delta2 = delta * delta
-        deltaN2 = deltaN * deltaN
-        m3 = buffer.getDouble(thirdMomentOffset)
-        m3 += -3.0 * deltaN * m2 + delta * (delta2 - deltaN2)
-        buffer.setDouble(thirdMomentOffset, m3)
-      }
-
-      if (momentOrder >= 4) {
-        m4 = buffer.getDouble(fourthMomentOffset)
-        m4 += -4.0 * deltaN * m3 - 6.0 * deltaN2 * m2 +
-          delta * (delta * delta2 - deltaN * deltaN2)
-        buffer.setDouble(fourthMomentOffset, m4)
-      }
-    }
-  }
-
-  /**
-   * Merge two central moment buffers.
-   */
-  override def merge(buffer1: MutableRow, buffer2: InternalRow): Unit = {
-    val n1 = buffer1.getDouble(nOffset)
-    val n2 = buffer2.getDouble(inputAggBufferOffset)
-    val mean1 = buffer1.getDouble(meanOffset)
-    val mean2 = buffer2.getDouble(inputAggBufferOffset + 1)
-
-    var secondMoment1 = 0.0
-    var secondMoment2 = 0.0
-
-    var thirdMoment1 = 0.0
-    var thirdMoment2 = 0.0
-
-    var fourthMoment1 = 0.0
-    var fourthMoment2 = 0.0
-
-    n = n1 + n2
-    buffer1.setDouble(nOffset, n)
-    delta = mean2 - mean1
-    deltaN = if (n == 0.0) 0.0 else delta / n
-    mean = mean1 + deltaN * n2
-    buffer1.setDouble(mutableAggBufferOffset + 1, mean)
+    val n1 = n.left
+    val n2 = n.right
+    val newN = n1 + n2
+    val delta = avg.right - avg.left
+    val deltaN = If(newN === 0.0, 0.0, delta / newN)
+    val newAvg = avg.left + deltaN * n2
 
     // higher order moments computed according to:
     // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Higher-order_statistics
-    if (momentOrder >= 2) {
-      secondMoment1 = buffer1.getDouble(secondMomentOffset)
-      secondMoment2 = buffer2.getDouble(inputAggBufferOffset + 2)
-      m2 = secondMoment1 + secondMoment2 + delta * deltaN * n1 * n2
-      buffer1.setDouble(secondMomentOffset, m2)
+    val newM2 = m2.left + m2.right + delta * deltaN * n1 * n2
+    // `m3.right` is not available if momentOrder < 3
+    val newM3 = if (momentOrder >= 3) {
+      m3.left + m3.right + deltaN * deltaN * delta * n1 * n2 * (n1 - n2) +
+        Literal(3.0) * deltaN * (n1 * m2.right - n2 * m2.left)
+    } else {
+      Literal(0.0)
+    }
+    // `m4.right` is not available if momentOrder < 4
+    val newM4 = if (momentOrder >= 4) {
+      m4.left + m4.right +
+        deltaN * deltaN * deltaN * delta * n1 * n2 * (n1 * n1 - n1 * n2 + n2 * n2) +
+        Literal(6.0) * deltaN * deltaN * (n1 * n1 * m2.right + n2 * n2 * m2.left) +
+        Literal(4.0) * deltaN * (n1 * m3.right - n2 * m3.left)
+    } else {
+      Literal(0.0)
     }
 
-    if (momentOrder >= 3) {
-      thirdMoment1 = buffer1.getDouble(thirdMomentOffset)
-      thirdMoment2 = buffer2.getDouble(inputAggBufferOffset + 3)
-      m3 = thirdMoment1 + thirdMoment2 + deltaN * deltaN * delta * n1 * n2 *
-        (n1 - n2) + 3.0 * deltaN * (n1 * secondMoment2 - n2 * secondMoment1)
-      buffer1.setDouble(thirdMomentOffset, m3)
-    }
-
-    if (momentOrder >= 4) {
-      fourthMoment1 = buffer1.getDouble(fourthMomentOffset)
-      fourthMoment2 = buffer2.getDouble(inputAggBufferOffset + 4)
-      m4 = fourthMoment1 + fourthMoment2 + deltaN * deltaN * deltaN * delta * n1 *
-        n2 * (n1 * n1 - n1 * n2 + n2 * n2) + deltaN * deltaN * 6.0 *
-        (n1 * n1 * secondMoment2 + n2 * n2 * secondMoment1) +
-        4.0 * deltaN * (n1 * thirdMoment2 - n2 * thirdMoment1)
-      buffer1.setDouble(fourthMomentOffset, m4)
-    }
+    trimHigherOrder(Seq(newN, newAvg, newM2, newM3, newM4))
   }
 
-  /**
-   * Compute aggregate statistic from sufficient moments.
-   * @param centralMoments Length `momentOrder + 1` array of central moments (un-normalized)
-   *                       needed to compute the aggregate stat.
-   */
-  def getStatistic(n: Double, mean: Double, centralMoments: Array[Double]): Any
+  protected def updateExpressionsDef: Seq[Expression] = {
+    val newN = n + 1.0
+    val delta = child - avg
+    val deltaN = delta / newN
+    val newAvg = avg + deltaN
+    val newM2 = m2 + delta * (delta - deltaN)
 
-  override final def eval(buffer: InternalRow): Any = {
-    val n = buffer.getDouble(nOffset)
-    val mean = buffer.getDouble(meanOffset)
-    val moments = Array.ofDim[Double](momentOrder + 1)
-    moments(0) = 1.0
-    moments(1) = 0.0
-    if (momentOrder >= 2) {
-      moments(2) = buffer.getDouble(secondMomentOffset)
+    val delta2 = delta * delta
+    val deltaN2 = deltaN * deltaN
+    val newM3 = if (momentOrder >= 3) {
+      m3 - Literal(3.0) * deltaN * newM2 + delta * (delta2 - deltaN2)
+    } else {
+      Literal(0.0)
     }
-    if (momentOrder >= 3) {
-      moments(3) = buffer.getDouble(thirdMomentOffset)
-    }
-    if (momentOrder >= 4) {
-      moments(4) = buffer.getDouble(fourthMomentOffset)
+    val newM4 = if (momentOrder >= 4) {
+      m4 - Literal(4.0) * deltaN * newM3 - Literal(6.0) * deltaN2 * newM2 +
+        delta * (delta * delta2 - deltaN * deltaN2)
+    } else {
+      Literal(0.0)
     }
 
-    getStatistic(n, mean, moments)
+    trimHigherOrder(Seq(
+      If(child.isNull, n, newN),
+      If(child.isNull, avg, newAvg),
+      If(child.isNull, m2, newM2),
+      If(child.isNull, m3, newM3),
+      If(child.isNull, m4, newM4)
+    ))
   }
+}
+
+// Compute the population standard deviation of a column
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = "_FUNC_(expr) - Returns the population standard deviation calculated from values of a group.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_(col) FROM VALUES (1), (2), (3) AS tab(col);
+       0.816496580927726
+  """,
+  group = "agg_funcs",
+  since = "1.6.0")
+// scalastyle:on line.size.limit
+case class StddevPop(
+    child: Expression,
+    nullOnDivideByZero: Boolean = !SQLConf.get.legacyStatisticalAggregate)
+  extends CentralMomentAgg(child, nullOnDivideByZero) {
+
+  def this(child: Expression) = this(child, !SQLConf.get.legacyStatisticalAggregate)
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType), sqrt(m2 / n))
+  }
+
+  override def prettyName: String = "stddev_pop"
+
+  override protected def withNewChildInternal(newChild: Expression): StddevPop =
+    copy(child = newChild)
+}
+
+// Compute the sample standard deviation of a column
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = "_FUNC_(expr) - Returns the sample standard deviation calculated from values of a group.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_(col) FROM VALUES (1), (2), (3) AS tab(col);
+       1.0
+  """,
+  group = "agg_funcs",
+  since = "1.6.0")
+// scalastyle:on line.size.limit
+case class StddevSamp(
+    child: Expression,
+    nullOnDivideByZero: Boolean = !SQLConf.get.legacyStatisticalAggregate)
+  extends CentralMomentAgg(child, nullOnDivideByZero) {
+
+  def this(child: Expression) = this(child, !SQLConf.get.legacyStatisticalAggregate)
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(n === 1.0, divideByZeroEvalResult, sqrt(m2 / (n - 1.0))))
+  }
+
+  override def prettyName: String =
+    getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("stddev_samp")
+
+  override protected def withNewChildInternal(newChild: Expression): StddevSamp =
+    copy(child = newChild)
+}
+
+// Compute the population variance of a column
+@ExpressionDescription(
+  usage = "_FUNC_(expr) - Returns the population variance calculated from values of a group.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_(col) FROM VALUES (1), (2), (3) AS tab(col);
+       0.6666666666666666
+  """,
+  group = "agg_funcs",
+  since = "1.6.0")
+case class VariancePop(
+    child: Expression,
+    nullOnDivideByZero: Boolean = !SQLConf.get.legacyStatisticalAggregate)
+  extends CentralMomentAgg(child, nullOnDivideByZero) {
+
+  def this(child: Expression) = this(child, !SQLConf.get.legacyStatisticalAggregate)
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType), m2 / n)
+  }
+
+  override def prettyName: String = "var_pop"
+
+  override protected def withNewChildInternal(newChild: Expression): VariancePop =
+    copy(child = newChild)
+}
+
+// Compute the sample variance of a column
+@ExpressionDescription(
+  usage = "_FUNC_(expr) - Returns the sample variance calculated from values of a group.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_(col) FROM VALUES (1), (2), (3) AS tab(col);
+       1.0
+  """,
+  group = "agg_funcs",
+  since = "1.6.0")
+case class VarianceSamp(
+    child: Expression,
+    nullOnDivideByZero: Boolean = !SQLConf.get.legacyStatisticalAggregate)
+  extends CentralMomentAgg(child, nullOnDivideByZero) {
+
+  def this(child: Expression) = this(child, !SQLConf.get.legacyStatisticalAggregate)
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(n === 1.0, divideByZeroEvalResult, m2 / (n - 1.0)))
+  }
+
+  override def prettyName: String = getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("var_samp")
+
+  override protected def withNewChildInternal(newChild: Expression): VarianceSamp =
+    copy(child = newChild)
+}
+
+@ExpressionDescription(
+  usage = "_FUNC_(expr) - Returns the skewness value calculated from values of a group.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_(col) FROM VALUES (-10), (-20), (100), (1000) AS tab(col);
+       1.1135657469022011
+      > SELECT _FUNC_(col) FROM VALUES (-1000), (-100), (10), (20) AS tab(col);
+       -1.1135657469022011
+  """,
+  group = "agg_funcs",
+  since = "1.6.0")
+case class Skewness(
+    child: Expression,
+    nullOnDivideByZero: Boolean = !SQLConf.get.legacyStatisticalAggregate)
+  extends CentralMomentAgg(child, nullOnDivideByZero) {
+
+  def this(child: Expression) = this(child, !SQLConf.get.legacyStatisticalAggregate)
+
+  override def prettyName: String = "skewness"
+
+  override protected def momentOrder = 3
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(m2 === 0.0, divideByZeroEvalResult, sqrt(n) * m3 / sqrt(m2 * m2 * m2)))
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): Skewness =
+    copy(child = newChild)
+}
+
+@ExpressionDescription(
+  usage = "_FUNC_(expr) - Returns the kurtosis value calculated from values of a group.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_(col) FROM VALUES (-10), (-20), (100), (1000) AS tab(col);
+       -0.7014368047529627
+      > SELECT _FUNC_(col) FROM VALUES (1), (10), (100), (10), (1) as tab(col);
+       0.19432323191699075
+  """,
+  group = "agg_funcs",
+  since = "1.6.0")
+case class Kurtosis(
+    child: Expression,
+    nullOnDivideByZero: Boolean = !SQLConf.get.legacyStatisticalAggregate)
+  extends CentralMomentAgg(child, nullOnDivideByZero) {
+
+  def this(child: Expression) = this(child, !SQLConf.get.legacyStatisticalAggregate)
+
+  override protected def momentOrder = 4
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(m2 === 0.0, divideByZeroEvalResult, n * m4 / (m2 * m2) - 3.0))
+  }
+
+  override def prettyName: String = "kurtosis"
+
+  override protected def withNewChildInternal(newChild: Expression): Kurtosis =
+    copy(child = newChild)
 }

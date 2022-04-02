@@ -18,12 +18,12 @@
 // scalastyle:off println
 package org.apache.spark.examples.mllib
 
+import org.apache.spark.{SparkConf, SparkContext}
 // $example on$
 import org.apache.spark.mllib.tree.DecisionTree
 import org.apache.spark.mllib.tree.model.DecisionTreeModel
 import org.apache.spark.mllib.util.MLUtils
 // $example off$
-import org.apache.spark.{SparkConf, SparkContext}
 
 object DecisionTreeRegressionExample {
 
@@ -54,13 +54,15 @@ object DecisionTreeRegressionExample {
       (point.label, prediction)
     }
     val testMSE = labelsAndPredictions.map{ case (v, p) => math.pow(v - p, 2) }.mean()
-    println("Test Mean Squared Error = " + testMSE)
-    println("Learned regression tree model:\n" + model.toDebugString)
+    println(s"Test Mean Squared Error = $testMSE")
+    println(s"Learned regression tree model:\n ${model.toDebugString}")
 
     // Save and load model
     model.save(sc, "target/tmp/myDecisionTreeRegressionModel")
     val sameModel = DecisionTreeModel.load(sc, "target/tmp/myDecisionTreeRegressionModel")
     // $example off$
+
+    sc.stop()
   }
 }
 // scalastyle:on println
